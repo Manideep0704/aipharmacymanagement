@@ -1,12 +1,40 @@
 """
 PharmaDash — Pharmacy Inventory & Sales Analytics
-Optimized version: faster reruns, cached aggregations, vectorised ops,
-lightweight charts, category dtypes, minimal CSS, lazy data loading.
+==================================================
+A multi-store pharmacy analytics dashboard built with Streamlit.
+
+Features
+--------
+* Role-based authentication (Admin / Store Owner)
+* Per-plan feature access control (Starter / Professional / Enterprise)
+* Real-time KPIs: stock value, revenue, expiry risk, low-stock alerts
+* Interactive charts: monthly revenue, category breakdown, supplier risk
+* AI-powered business insights via Groq / LLaMA
+* Excel report download filtered by store, category, supplier, and date range
+
+Performance notes
+-----------------
+* All DataFrames are loaded once via ``@st.cache_data`` and never mutated.
+* Aggregations are cached by their filter-parameter signature.
+* High-cardinality string columns use ``category`` dtype for fast groupby.
+* Numeric columns are downcast to ``float32`` to reduce memory footprint.
+
+Dependencies
+------------
+    streamlit, pandas, numpy, plotly, openpyxl
+    groq, python-dotenv  (optional — required for AI Insights)
+
+Usage
+-----
+    streamlit run pharma_update.py
 """
 
 # ── Standard library ──────────────────────────────────────────────────────────
-import os
+import datetime
+import hashlib
 import io
+import logging
+import os
 
 # ── Third-party ───────────────────────────────────────────────────────────────
 import streamlit as st
@@ -14,13 +42,6 @@ import pandas as pd
 import numpy as np
 import plotly.express as px
 import plotly.graph_objects as go
-from dotenv import load_dotenv
-
-# # This searches for the .env file and loads the variables
-# load_dotenv() 
-
-# # Now you can safely access it
-# api_key = os.getenv("GROQ_API_KEY")
 
 # ── AI / Groq ─────────────────────────────────────────────────────────────────
 try:
@@ -31,7 +52,16 @@ try:
 except ImportError:
     _GROQ_AVAILABLE = False
 
-# Initialise Groq client once (None if key/package missing)
+__version__: str = "1.0.0"
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s  %(levelname)-8s  %(name)s — %(message)s",
+    datefmt="%Y-%m-%d %H:%M:%S",
+)
+logger = logging.getLogger(__name__)
+
+
 _groq_client = None
 if _GROQ_AVAILABLE:
     _api_key = os.getenv("GROQ_API_KEY", "")
@@ -39,6 +69,7 @@ if _GROQ_AVAILABLE:
         try:
             _groq_client = Groq(api_key=_api_key)
         except Exception:
+            logger.exception("Failed to initialise Groq client.")
             _groq_client = None
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -50,6 +81,277 @@ st.set_page_config(
     layout="wide",
     initial_sidebar_state="expanded",
 )
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# AUTH — User accounts & login gate
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def _hash(pw: str) -> str:
+    """Return a SHA-256 hex digest of the given password string."""
+    return hashlib.sha256(pw.encode()).hexdigest()
+
+# ── User database ──────────────────────────────────────────────────────────────
+# role: "admin" sees everything + Admin panel; "manager" sees all except Admin;
+# "pharmacist" / "analyst" / "viewer" have restricted nav
+_USERS: dict[str, dict] = {
+    # ── Super Admin ────────────────────────────────────────────────────────────
+    "admin": {
+        "password": _hash("Admin@2026"),
+        "role": "admin",
+        "name": "System Administrator",
+        "store": "All Stores",
+        "avatar": "🛡️",
+    },
+    # ── Store Owners — one per store ───────────────────────────────────────────
+    "medplus_store": {
+        "password": _hash("MedPlus@001"),
+        "role": "store_owner",
+        "name": "MedPlus Ameerpet",
+        "store": "MedPlus Ameerpet",
+        "avatar": "🏪",
+        "plan": "Professional",
+    },
+    "apollo_store": {
+        "password": _hash("Apollo@002"),
+        "role": "store_owner",
+        "name": "Apollo Kukatpally",
+        "store": "Apollo Kukatpally",
+        "avatar": "🏥",
+        "plan": "Enterprise",
+    },
+    "wellcare_store": {
+        "password": _hash("WellCare@003"),
+        "role": "store_owner",
+        "name": "WellCare Banjara Hills",
+        "store": "WellCare Banjara Hills",
+        "avatar": "🩺",
+        "plan": "Starter",
+    },
+    "healthfirst_store": {
+        "password": _hash("Health@004"),
+        "role": "store_owner",
+        "name": "HealthFirst Madhapur",
+        "store": "HealthFirst Madhapur",
+        "avatar": "💉",
+        "plan": "Professional",
+    },
+    "citymed_store": {
+        "password": _hash("CityMed@005"),
+        "role": "store_owner",
+        "name": "CityMed Dilsukhnagar",
+        "store": "CityMed Dilsukhnagar",
+        "avatar": "🧬",
+        "plan": "Enterprise",
+    },
+}
+
+# Pages visible per role
+_ROLE_PAGES: dict[str, list[str]] = {
+
+    "admin": [
+        "🔐  Admin Panel",
+        "👥  Subscribers",
+        "💳  Plan Details"
+    ],
+
+    "store_owner": [
+        "🏠  Home",
+        "☀️  Morning Briefing",
+        "📊  Overview",
+        "🧪  Inventory & Expiry",
+        "📈  Sales & Demand",
+        "🏪  Supplier & Store",
+        "💡  Business Insights",
+        "💳  Plan Details",
+        "ℹ️  About Us"
+    ],
+}
+
+
+PLAN_FEATURE_ACCESS = {
+    "Starter": ["🏠  Home","📊  Overview","🧪  Inventory & Expiry","💳  Plan Details","ℹ️  About Us"],
+    "Professional": ["🏠  Home","☀️  Morning Briefing","📊  Overview","🧪  Inventory & Expiry","📈  Sales & Demand","🏪  Supplier & Store","💳  Plan Details","ℹ️  About Us"],
+    "Enterprise": ["🏠  Home","☀️  Morning Briefing","📊  Overview","🧪  Inventory & Expiry","📈  Sales & Demand","🏪  Supplier & Store","💡  Business Insights","💳  Plan Details","ℹ️  About Us"],
+}
+
+# ── Session init ───────────────────────────────────────────────────────────────
+if "logged_in" not in st.session_state:
+    st.session_state.logged_in    = False
+    st.session_state.username     = ""
+    st.session_state.user_role    = ""
+    st.session_state.user_name    = ""
+    st.session_state.user_store   = "All"
+    st.session_state.user_avatar  = ""
+    st.session_state.login_error  = ""
+    st.session_state.login_attempt_time = None
+
+# ── Login page CSS & logic ─────────────────────────────────────────────────────
+if not st.session_state.logged_in:
+    st.markdown("""
+    <style>
+    @import url('https://fonts.googleapis.com/css2?family=Nunito:wght@300;400;600;700;800;900&family=Rajdhani:wght@500;600;700&display=swap');
+    .stApp {
+      background: linear-gradient(148deg,#dbeeff 0%,#c5dff8 35%,#d6ecff 65%,#e8f4ff 100%);
+      min-height:100vh;
+    }
+    .stApp::before {
+      content:"";position:fixed;inset:0;pointer-events:none;z-index:0;
+      background-image:url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='130' height='150'%3E%3Cpolygon points='65,7 118,36 118,94 65,123 12,94 12,36' fill='none' stroke='rgba(255,255,255,0.55)' stroke-width='1.1'/%3E%3Crect x='57' y='53' width='16' height='5' rx='2.5' fill='rgba(255,255,255,0.30)'/%3E%3Crect x='62' y='48' width='5' height='16' rx='2.5' fill='rgba(255,255,255,0.30)'/%3E%3C%2Fsvg%3E");
+      background-size:130px 150px;animation:hexdrift 35s ease-in-out infinite alternate;
+    }
+    @keyframes hexdrift{0%{background-position:0px 0px}100%{background-position:26px 20px}}
+    [data-testid="stSidebar"]{display:none !important}
+    .main .block-container{max-width:1100px;margin:0 auto;padding-top:3vh;position:relative;z-index:1}
+    div[data-testid="stTextInput"] input {
+      background:#fff !important;
+      color:#1a3a55 !important;border:1.5px solid #c5d8f0 !important;
+      border-radius:10px !important;padding:12px 16px !important;font-size:0.95rem !important;
+    }
+    div[data-testid="stTextInput"] label {
+      color:#4a6a8a !important;font-weight:700 !important;font-size:0.82rem !important;
+      letter-spacing:0.8px !important;
+    }
+    div[data-testid="stTextInput"] input::placeholder{color:#a0b8cc !important}
+    div[data-testid="stTextInput"] input:focus{
+      border-color:#1976D2 !important;
+      box-shadow:0 0 0 3px rgba(25,118,210,0.12) !important;
+    }
+    div[data-testid="stButton"]>button{
+      background:linear-gradient(135deg,#E53935,#ef5350) !important;
+      color:#fff !important;border:none !important;border-radius:10px !important;
+      font-weight:800 !important;font-size:1rem !important;letter-spacing:0.5px !important;
+      padding:12px !important;transition:all 0.2s !important;
+      box-shadow:0 4px 18px rgba(229,57,53,0.35) !important;
+    }
+    div[data-testid="stButton"]>button:hover{
+      background:linear-gradient(135deg,#c62828,#e53935) !important;
+      transform:translateY(-2px) !important;box-shadow:0 6px 22px rgba(229,57,53,0.50) !important;
+    }
+    </style>""", unsafe_allow_html=True)
+
+    # ── Two-column layout: left = login form, right = stores panel ─────────────
+    _lc, _rc = st.columns([1, 1], gap="large")
+
+    with _lc:
+        # Header
+        st.markdown("""
+        <div style="padding:24px 0 20px;position:relative;z-index:1">
+          <div style="font-family:'Rajdhani',sans-serif;font-size:2.2rem;font-weight:700;
+                      color:#0d2f52;letter-spacing:3px">
+            PHARMA<span style="color:#1565C0">DASH</span>
+          </div>
+          <div style="font-size:0.75rem;color:#7a9ab8;letter-spacing:1.8px;margin-top:2px">
+            Store Admin Portal · Hyderabad Pharmacy Network
+          </div>
+        </div>""", unsafe_allow_html=True)
+
+        # Login card
+        st.markdown("""
+        <div style="background:#fff;border:1.5px solid #d6e8f8;
+                    border-radius:18px;padding:30px 32px 24px;
+                    box-shadow:0 8px 32px rgba(21,101,192,0.10);
+                    position:relative;z-index:1">
+          <div style="font-size:0.72rem;font-weight:800;color:#E53935;
+                      letter-spacing:1.5px;margin-bottom:18px">
+            🔒 SIGN IN
+          </div>""", unsafe_allow_html=True)
+
+        uname = st.text_input("Username", placeholder="Enter your username", key="login_user")
+        passw = st.text_input("Password", placeholder="Enter your store password",
+                              type="password", key="login_pass")
+
+        if st.session_state.login_error:
+            st.markdown(f"""<div style="background:rgba(229,57,53,0.08);border:1px solid rgba(229,57,53,0.35);
+                border-radius:8px;padding:8px 12px;margin:8px 0;
+                color:#c62828;font-size:0.82rem;font-weight:600">
+                ⚠️ {st.session_state.login_error}</div>""", unsafe_allow_html=True)
+
+        if st.button("Sign In →", use_container_width=True, key="btn_login"):
+            u = uname.strip().lower()
+            if u in _USERS and _USERS[u]["password"] == _hash(passw):
+                st.session_state.logged_in   = True
+                st.session_state.username    = u
+                st.session_state.user_role   = _USERS[u]["role"]
+                st.session_state.user_name   = _USERS[u]["name"]
+                st.session_state.user_store  = _USERS[u]["store"]
+                st.session_state.user_avatar = _USERS[u]["avatar"]
+                st.session_state.login_error = ""
+                st.session_state.active_page = _ROLE_PAGES[_USERS[u]["role"]][0]
+                st.rerun()
+            else:
+                st.session_state.login_error = "Invalid username or password. Please try again."
+                st.rerun()
+
+        st.markdown("</div>", unsafe_allow_html=True)
+
+        # Store login credentials accordion
+        with st.expander("📋 Store Login Credentials", expanded=False):
+            st.markdown("""
+            <div style="font-size:0.76rem;color:#4a6a8a;margin-bottom:10px">
+              Use the credentials below to sign in as a specific store admin.
+            </div>""", unsafe_allow_html=True)
+            _actual_creds = [
+                ("🏪", "MedPlus Ameerpet",      "medplus_store",      "MedPlus@001"),
+                ("🏥", "Apollo Kukatpally",      "apollo_store",       "Apollo@002"),
+                ("🩺", "WellCare Banjara Hills", "wellcare_store",     "WellCare@003"),
+                ("💉", "HealthFirst Madhapur",   "healthfirst_store",  "Health@004"),
+                ("🧬", "CityMed Dilsukhnagar",   "citymed_store",      "CityMed@005"),
+            ]
+            for _ico, _sname, _uname, _pw in _actual_creds:
+                st.markdown(f"""
+                <div style="display:flex;align-items:center;justify-content:space-between;
+                            padding:8px 10px;border-radius:8px;margin-bottom:4px;
+                            background:rgba(21,101,192,0.04);border:1px solid rgba(21,101,192,0.10)">
+                  <div style="display:flex;align-items:center;gap:8px">
+                    <span style="font-size:1.1rem">{_ico}</span>
+                    <span style="font-size:0.82rem;font-weight:700;color:#0b3d6e">{_sname}</span>
+                  </div>
+                  <div style="display:flex;gap:8px">
+                    <span style="background:#e3f0ff;color:#1565C0;font-size:0.70rem;font-weight:700;
+                                padding:3px 9px;border-radius:6px">{_uname}</span>
+                    <span style="background:#e8f5e9;color:#2E7D32;font-size:0.70rem;font-weight:700;
+                                padding:3px 9px;border-radius:6px">{_pw}</span>
+                  </div>
+                </div>""", unsafe_allow_html=True)
+
+    with _rc:
+        # Registered stores panel
+        st.markdown("""
+        <div style="padding:24px 0 16px">
+          <div style="font-size:0.70rem;font-weight:800;color:#7a9ab8;letter-spacing:2px;margin-bottom:14px">
+            🏥 REGISTERED STORES
+          </div>""", unsafe_allow_html=True)
+
+        _stores_info = [
+            ("🏪", "MedPlus Ameerpet",      "Ameerpet",      "HYD001", "#E53935"),
+            ("🏥", "Apollo Kukatpally",      "Kukatpally",    "HYD002", "#7B1FA2"),
+            ("🩺", "WellCare Banjara Hills", "Banjara Hills", "HYD003", "#0288D1"),
+            ("💉", "HealthFirst Madhapur",   "Madhapur",      "HYD004", "#00897B"),
+            ("🧬", "CityMed Dilsukhnagar",   "Dilsukhnagar",  "HYD005", "#F57C00"),
+        ]
+        for _ico, _sname, _area, _id, _clr in _stores_info:
+            st.markdown(f"""
+            <div style="background:#fff;border:1.5px solid #d6e8f8;border-radius:12px;
+                        padding:14px 18px;margin-bottom:10px;
+                        box-shadow:0 2px 10px rgba(21,101,192,0.06);
+                        display:flex;align-items:center;gap:14px">
+              <div style="font-size:1.6rem;width:38px;height:38px;
+                          background:rgba(21,101,192,0.06);border-radius:10px;
+                          display:flex;align-items:center;justify-content:center">{_ico}</div>
+              <div style="flex:1">
+                <div style="font-weight:800;font-size:0.92rem;color:#0b3d6e">{_sname}</div>
+                <div style="display:flex;align-items:center;gap:6px;margin-top:3px">
+                  <span style="width:6px;height:6px;background:{_clr};border-radius:50%;display:inline-block"></span>
+                  <span style="font-size:0.74rem;color:#7a9ab8">{_area}</span>
+                  <span style="font-size:0.72rem;color:#a0b8cc;margin-left:4px">· {_id}</span>
+                </div>
+              </div>
+            </div>""", unsafe_allow_html=True)
+
+        st.markdown("</div>", unsafe_allow_html=True)
+
+    st.stop()   # ← Do NOT render any further until logged in
+
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # CSS — all styles inline (no external file needed)
@@ -315,7 +617,6 @@ ul[role="listbox"] li:hover,ul[role="listbox"] [role="option"]:hover{
   border:1px solid rgba(255,255,255,0.50);padding:12px 16px;
   box-shadow:0 3px 12px rgba(21,101,192,0.07)}
 
-/* ── AI ASSISTANT STYLES ── */
 .ai-section-title{
   font-family:'Rajdhani',sans-serif;font-size:1.3rem;font-weight:700;
   color:#0b3d6e;letter-spacing:1px;margin:28px 0 14px;
@@ -438,7 +739,7 @@ def load_data() -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame,
     All downstream operations filter/aggregate these — never mutate them.
     """
     try:
-        base  = os.path.dirname(os.path.abspath(__file__))
+        base = os.path.dirname(os.path.abspath(__file__))
         _required = {
             "Fact_Sales_20k.csv": "Sales transactions",
             "Fact_Stock_20k.csv": "Stock records",
@@ -879,6 +1180,7 @@ def generate_ai_insights(summary_data: str, user_question: str | None = None,
                 return text.strip()
         except Exception as e:
             last_err = str(e)
+            logger.warning("Groq model %s failed: %s", model, e)
             continue   # try fallback model
 
     # All models failed
@@ -1205,125 +1507,172 @@ with st.sidebar:
         INVENTORY &amp; SALES ANALYTICS
       </div>
     </div>""", unsafe_allow_html=True)
+
+    # ── Logged-in user card ────────────────────────────────────────────────────
+    _role_badge_colors = {
+        "admin": "#E53935", "store_owner": "#1976D2",
+    }
+    _rbg = _role_badge_colors.get(st.session_state.user_role, "#1976D2")
+    st.markdown(f"""
+    <div style="background:rgba(255,255,255,0.10);border:1px solid rgba(255,255,255,0.22);
+                border-radius:12px;padding:12px 14px;margin-bottom:8px">
+      <div style="display:flex;align-items:center;gap:10px">
+        <div style="font-size:1.8rem;line-height:1">{st.session_state.user_avatar}</div>
+        <div>
+          <div style="font-weight:800;font-size:0.88rem;color:#fff">{st.session_state.user_name}</div>
+          <div style="display:inline-block;background:{_rbg};color:#fff;
+                      font-size:0.62rem;font-weight:800;letter-spacing:1px;
+                      padding:2px 8px;border-radius:20px;margin-top:2px;text-transform:uppercase">
+            {st.session_state.user_role}
+          </div>
+        </div>
+      </div>
+    </div>""", unsafe_allow_html=True)
+    if st.button("Logout", key="btn_logout", use_container_width=True, type="secondary"):
+        for _k in list(st.session_state.keys()):
+            del st.session_state[_k]
+        st.rerun()
     st.markdown("---")
 
     st.markdown(
         "<p style='color:#7ec8e8;font-size:0.72rem;font-weight:800;"
-        "letter-spacing:1.5px;margin:0 0 7px'>📌 NAVIGATION</p>",
+        "letter-spacing:1.5px;margin:0 0 7px'>NAVIGATION</p>",
         unsafe_allow_html=True,
     )
-    _NAV_ITEMS = [
-        "🏠  Home",
-        "☀️  Morning Briefing",
-        "📊  Overview",
-        "🧪  Inventory & Expiry",
-        "📈  Sales & Demand",
-        "🏪  Supplier & Store",
-        "💡  Business Insights",
-        "ℹ️  About",
-    ]
+
+    # ── Build nav list: role pages filtered by plan access for store_owners ───
+    _is_store_owner = st.session_state.user_role == "store_owner"
+    _owner_store    = st.session_state.user_store
+    _sid_uname      = st.session_state.username
+    _sid_plan       = _USERS.get(_sid_uname, {}).get("plan", None)
+
+    _ROLE_NAV = _ROLE_PAGES.get(st.session_state.user_role, ["🏠  Home"])
+    if _is_store_owner and _sid_plan and _sid_plan in PLAN_FEATURE_ACCESS:
+        # Only show pages the plan actually grants
+        _allowed = PLAN_FEATURE_ACCESS[_sid_plan]
+        _NAV_ITEMS = [p for p in _ROLE_NAV if p in _allowed]
+    else:
+        _NAV_ITEMS = _ROLE_NAV   # admin → all pages unchanged
+
     if "active_page" not in st.session_state:
         st.session_state.active_page = _NAV_ITEMS[0]
+    # If active page is no longer accessible (e.g. after plan change), reset
+    if st.session_state.active_page not in _NAV_ITEMS:
+        st.session_state.active_page = _NAV_ITEMS[0]
+
     for _item in _NAV_ITEMS:
         _active = st.session_state.active_page == _item
-        st.markdown(f"""
-        <style>
-        div[data-testid="stButton"] button[kind="secondary"].nav-btn-{_item[:3].strip()}{{
-            background:{'rgba(255,255,255,0.25)' if _active else 'rgba(255,255,255,0.08)'} !important;
-            border:{'2px solid rgba(255,255,255,0.70)' if _active else '1px solid rgba(255,255,255,0.18)'} !important;
-        }}
-        </style>""", unsafe_allow_html=True)
-        if st.button(
-            _item,
-            key=f"nav_{_item}",
-            use_container_width=True,
-            type="secondary",
-        ):
+        st.markdown(
+            "<style>div[data-testid='stButton'] button[kind='secondary'].nav-btn-"
+            + _item[:3].strip() + "{"
+            + ("background:rgba(255,255,255,0.25) !important;"
+               "border:2px solid rgba(255,255,255,0.70) !important;"
+               if _active else
+               "background:rgba(255,255,255,0.08) !important;"
+               "border:1px solid rgba(255,255,255,0.18) !important;")
+            + "}</style>",
+            unsafe_allow_html=True,
+        )
+        if st.button(_item, key="nav_" + _item, use_container_width=True, type="secondary"):
             st.session_state.active_page = _item
             st.rerun()
     page = st.session_state.active_page
 
-    st.markdown("---")
-    st.markdown(
-        "<p style='color:#7ec8e8;font-size:0.72rem;font-weight:800;"
-        "letter-spacing:1.5px;margin:0 0 7px'>🔽 FILTERS</p>",
-        unsafe_allow_html=True,
-    )
-
-    # ── Session-state defaults (written once) ─────────────────────────────────
+    # ── Session-state defaults — always initialised (needed by DR_MIN etc.) ───
     _DEFAULTS: dict = {
         "dr_min": DATE_MIN, "dr_max": DATE_MAX,
-        "sel_store": "All", "sel_cat": "All",
+        "sel_store": _owner_store if _is_store_owner else "All",
+        "sel_cat": "All",
         "sel_supplier": "All", "sel_status": "All",
     }
     for _k, _v in _DEFAULTS.items():
         if _k not in st.session_state:
             st.session_state[_k] = _v
+    if _is_store_owner:
+        st.session_state.sel_store = _owner_store
 
-    # AI assistant state — persists across reruns, never reset by filters
     for _ai_key in ("ai_insights_result", "ai_chat_result", "ai_chat_question"):
         if _ai_key not in st.session_state:
             st.session_state[_ai_key] = None
-    # Multi-turn chat history: list of {"role": "user"|"assistant", "content": str}
     if "ai_chat_history" not in st.session_state:
         st.session_state["ai_chat_history"] = []
-
-    # Expiry action log — persists across reruns
     if "expiry_actions" not in st.session_state:
-        st.session_state["expiry_actions"] = {}   # key: (ProductName, BatchNumber, Store_Name) → action str
+        st.session_state["expiry_actions"] = {}
 
-    def _clear_filters() -> None:
-        """Reset all filter session-state values to defaults and force a clean rerun."""
-        for _k, _v in _DEFAULTS.items():
-            st.session_state[_k] = _v
-        # Delete widget keys so Streamlit re-initialises them from the
-        # index= argument on the next rerun (avoids stale-value conflicts).
-        for _wk in ("date_range_input", "sel_store_widget",
-                    "sel_cat_widget", "sel_supplier_widget", "sel_status_widget"):
-            st.session_state.pop(_wk, None)
+    # ── FILTERS — shown for store owners only; admin has no need for filters ──
+    if _is_store_owner:
+        st.markdown("---")
+        st.markdown(
+            "<p style='color:#7ec8e8;font-size:0.72rem;font-weight:800;"
+            "letter-spacing:1.5px;margin:0 0 7px'>🔽 FILTERS</p>",
+            unsafe_allow_html=True,
+        )
 
-    # All widgets apply instantly — no form submit needed
-    date_range   = st.date_input("📅 Date Range",
-                                 value=[st.session_state.dr_min, st.session_state.dr_max],
-                                 min_value=DATE_MIN,
-                                 max_value=DATE_MAX,
-                                 key="date_range_input")
-    if isinstance(date_range, (list, tuple)) and len(date_range) == 2:
-        st.session_state.dr_min = date_range[0]
-        st.session_state.dr_max = date_range[1]
+        def _clear_filters() -> None:
+            for _k, _v in _DEFAULTS.items():
+                st.session_state[_k] = _v
+            if _is_store_owner:
+                st.session_state["sel_store"] = _owner_store
+            for _wk in ("date_range_input", "sel_store_widget",
+                        "sel_cat_widget", "sel_supplier_widget", "sel_status_widget"):
+                st.session_state.pop(_wk, None)
 
-    sel_store    = st.selectbox("🏪 Store Name",    _STORE_OPTS,
-                                index=_STORE_OPTS.index(st.session_state.sel_store),
-                                key="sel_store_widget")
-    sel_cat      = st.selectbox("💊 Category",      _CAT_OPTS,
-                                index=_CAT_OPTS.index(st.session_state.sel_cat),
-                                key="sel_cat_widget")
-    sel_supplier = st.selectbox("🏭 Supplier Name", _SUPPLIER_OPTS,
-                                index=_SUPPLIER_OPTS.index(st.session_state.sel_supplier),
-                                key="sel_supplier_widget")
-    sel_status   = st.selectbox("📦 Stock Status",  _STATUS_OPTS,
-                                index=_STATUS_OPTS.index(st.session_state.sel_status),
-                                key="sel_status_widget")
+        date_range = st.date_input(
+            "📅 Date Range",
+            value=[st.session_state.dr_min, st.session_state.dr_max],
+            min_value=DATE_MIN, max_value=DATE_MAX,
+            key="date_range_input",
+        )
+        if isinstance(date_range, (list, tuple)) and len(date_range) == 2:
+            st.session_state.dr_min = date_range[0]
+            st.session_state.dr_max = date_range[1]
 
-    st.session_state.sel_store    = sel_store
-    st.session_state.sel_cat      = sel_cat
-    st.session_state.sel_supplier = sel_supplier
-    st.session_state.sel_status   = sel_status
+        # Store always locked for store_owners
+        st.markdown(
+            '<div style="background:rgba(21,101,192,0.18);border:1px solid rgba(100,181,246,0.40);'
+            'border-radius:9px;padding:9px 13px;margin-bottom:6px">'
+            '<div style="font-size:0.70rem;font-weight:800;color:#a8d4f0;'
+            'letter-spacing:0.8px;margin-bottom:3px">&#127978; STORE (LOCKED)</div>'
+            '<div style="font-weight:800;font-size:0.88rem;color:#fff">' + _owner_store + '</div>'
+            '</div>',
+            unsafe_allow_html=True,
+        )
+        sel_store    = _owner_store
+        sel_cat      = st.selectbox("💊 Category",      _CAT_OPTS,
+                                    index=_CAT_OPTS.index(st.session_state.sel_cat),
+                                    key="sel_cat_widget")
+        sel_supplier = st.selectbox("🏭 Supplier Name", _SUPPLIER_OPTS,
+                                    index=_SUPPLIER_OPTS.index(st.session_state.sel_supplier),
+                                    key="sel_supplier_widget")
+        sel_status   = st.selectbox("📦 Stock Status",  _STATUS_OPTS,
+                                    index=_STATUS_OPTS.index(st.session_state.sel_status),
+                                    key="sel_status_widget")
 
-    st.button("🗑️ Clear All Filters", on_click=_clear_filters,
-              use_container_width=True, type="primary")
-    # Download — cached by filter params; only re-builds when filters change
-    st.download_button(
-        label="⬇ Download Filtered Report",
-        data=build_report(
-            st.session_state.dr_min, st.session_state.dr_max,
-            st.session_state.sel_store, st.session_state.sel_cat,
-            st.session_state.sel_supplier, st.session_state.sel_status,
-        ),
-        file_name="PharmaDash_Report.xlsx",
-        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-        use_container_width=True,
-    )
+        st.session_state.sel_store    = sel_store
+        st.session_state.sel_cat      = sel_cat
+        st.session_state.sel_supplier = sel_supplier
+        st.session_state.sel_status   = sel_status
+
+        st.button("🗑️ Clear All Filters", on_click=_clear_filters,
+                  use_container_width=True, type="primary")
+        st.download_button(
+            label="⬇ Download Filtered Report",
+            data=build_report(
+                st.session_state.dr_min, st.session_state.dr_max,
+                st.session_state.sel_store, st.session_state.sel_cat,
+                st.session_state.sel_supplier, st.session_state.sel_status,
+            ),
+            file_name="PharmaDash_Report.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            use_container_width=True,
+        )
+    else:
+        # Admin: set sensible defaults for filter vars (used by data functions)
+        st.session_state.sel_store    = "All"
+        st.session_state.sel_cat      = "All"
+        st.session_state.sel_supplier = "All"
+        st.session_state.sel_status   = "All"
+
     st.markdown("---")
     st.markdown(
         "<p style='color:rgba(255,255,255,0.30);font-size:0.67rem;"
@@ -1339,6 +1688,35 @@ SEL_STORE = st.session_state.sel_store
 SEL_CAT   = st.session_state.sel_cat
 SEL_SUP   = st.session_state.sel_supplier
 SEL_STS   = st.session_state.sel_status
+
+# ── Store owner welcome banner — shown on every page ──────────────────────────
+if st.session_state.user_role == "store_owner":
+    _store_icons = {
+        "MedPlus Ameerpet": "🏪", "Apollo Kukatpally": "🏥",
+        "WellCare Banjara Hills": "🩺", "HealthFirst Madhapur": "💉",
+        "CityMed Dilsukhnagar": "🧬",
+    }
+    _sico = _store_icons.get(SEL_STORE, "🏪")
+    st.markdown(f"""
+    <div style="background:linear-gradient(135deg,rgba(21,101,192,0.14),rgba(0,188,212,0.10));
+                border:1px solid rgba(21,101,192,0.30);border-left:5px solid #1976D2;
+                border-radius:12px;padding:10px 18px;margin-bottom:14px;
+                display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:8px">
+      <div style="display:flex;align-items:center;gap:10px">
+        <span style="font-size:1.4rem">{_sico}</span>
+        <div>
+          <div style="font-family:'Rajdhani',sans-serif;font-size:1.05rem;font-weight:700;
+                      color:#0b3d6e;letter-spacing:0.5px">{SEL_STORE}</div>
+          <div style="font-size:0.72rem;color:#4a6a8a">
+            Viewing your store data · {st.session_state.user_name}
+          </div>
+        </div>
+      </div>
+      <div style="background:rgba(21,101,192,0.12);color:#0b3d6e;font-size:0.72rem;
+                  font-weight:800;padding:4px 14px;border-radius:20px;letter-spacing:0.5px">
+        🔒 STORE LOCKED
+      </div>
+    </div>""", unsafe_allow_html=True)
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -1392,8 +1770,10 @@ if page == "🏠  Home":
          "Monthly revenue trends, top-selling medicines, category performance, and customer-type breakdowns."),
     ]
     for col, (icon, title, c1c, c2c, desc) in zip([c1, c2, c3], _FEATURES):
+        _gc1 = c1c + "CC"
+        _gc2 = c2c + "BB"
         col.markdown(f"""
-        <div style="background:linear-gradient(135deg,{c1c}CC,{c2c}BB);border:1px solid rgba(255,255,255,0.30);
+        <div style="background:linear-gradient(135deg,{_gc1},{_gc2});border:1px solid rgba(255,255,255,0.30);
                     border-radius:16px;padding:22px 20px;height:100%;
                     box-shadow:0 4px 20px rgba(0,0,0,0.12);
                     transition:transform 0.2s">
@@ -1417,8 +1797,10 @@ if page == "🏠  Home":
          "Filter by date range, store, category, supplier, and stock status. Clear all filters instantly with one click."),
     ]
     for col, (icon, title, c1c, c2c, desc) in zip([c4, c5, c6], _FEATURES2):
+        _gc1 = c1c + "CC"
+        _gc2 = c2c + "BB"
         col.markdown(f"""
-        <div style="background:linear-gradient(135deg,{c1c}CC,{c2c}BB);border:1px solid rgba(255,255,255,0.30);
+        <div style="background:linear-gradient(135deg,{_gc1},{_gc2});border:1px solid rgba(255,255,255,0.30);
                     border-radius:16px;padding:22px 20px;height:100%;
                     box-shadow:0 4px 20px rgba(0,0,0,0.12)">
           <div style="font-size:2rem;margin-bottom:10px">{icon}</div>
@@ -1439,13 +1821,50 @@ if page == "🏠  Home":
     </div>
     """, unsafe_allow_html=True)
 
+    # Revenue card for store_owner
+    if st.session_state.user_role == "store_owner":
+        _home_kpis = get_overview_kpis(DR_MIN, DR_MAX, SEL_STORE, SEL_CAT, SEL_SUP, SEL_STS)
+        _home_rev  = _home_kpis["total_rev"]
+        _home_units = _home_kpis["total_units"]
+        st.markdown(f"""
+        <div style="background:linear-gradient(135deg,#1565C0 0%,#0d3d7a 60%,#00838f 100%);
+                    border-radius:20px;padding:36px 40px;margin:24px 0 8px;
+                    box-shadow:0 8px 32px rgba(21,101,192,0.32);
+                    display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:24px">
+          <div>
+            <div style="font-size:0.70rem;font-weight:800;color:rgba(255,255,255,0.60);
+                        letter-spacing:2.5px;margin-bottom:10px">STORE TOTAL REVENUE</div>
+            <div style="font-family:'Rajdhani',sans-serif;font-size:3.2rem;font-weight:700;
+                        color:#fff;letter-spacing:1px;line-height:1">₹ {_home_rev:,.0f}</div>
+            <div style="font-size:0.78rem;color:rgba(255,255,255,0.60);margin-top:8px">
+              {SEL_STORE} · Selected date range
+            </div>
+          </div>
+          <div style="display:flex;gap:32px;flex-wrap:wrap">
+            <div style="text-align:center">
+              <div style="font-size:0.65rem;font-weight:800;color:rgba(255,255,255,0.55);
+                          letter-spacing:2px;margin-bottom:6px">UNITS SOLD</div>
+              <div style="font-family:'Rajdhani',sans-serif;font-size:1.9rem;font-weight:700;
+                          color:#80d8ff">{_home_units:,}</div>
+              <div style="font-size:0.72rem;color:rgba(255,255,255,0.50);margin-top:4px">total units</div>
+            </div>
+            <div style="text-align:center">
+              <div style="font-size:0.65rem;font-weight:800;color:rgba(255,255,255,0.55);
+                          letter-spacing:2px;margin-bottom:6px">EST. GST</div>
+              <div style="font-family:'Rajdhani',sans-serif;font-size:1.9rem;font-weight:700;
+                          color:#b2ebf2">₹ {_home_rev * 0.12:,.0f}</div>
+              <div style="font-size:0.72rem;color:rgba(255,255,255,0.50);margin-top:4px">~12% of revenue</div>
+            </div>
+          </div>
+        </div>
+        """, unsafe_allow_html=True)
+
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # PAGE 0B — MORNING BRIEFING
 # ═══════════════════════════════════════════════════════════════════════════════
 elif page == "☀️  Morning Briefing":
-    import datetime as _dt
-    _now = _dt.datetime.now()
+    _now = datetime.datetime.now()
     _greeting = "Good Morning" if _now.hour < 12 else ("Good Afternoon" if _now.hour < 17 else "Good Evening")
 
     st.markdown(f"""
@@ -1646,14 +2065,39 @@ elif page == "☀️  Morning Briefing":
             for sev, txt in tasks
         ])
 
-    # All-stores tab + one tab per store
-    _all_stores_list = sorted(stock_df["Store_Name"].dropna().unique().tolist())
-    _tab_labels = ["🏬 All Stores"] + [f"🏪 {s.split()[0]}" for s in _all_stores_list]
+    # ── Role-Based Store Tabs ─────────────────────────────────────
+
+    if st.session_state.user_role == "admin":
+
+        # Admin sees all stores
+        _all_stores_list = sorted(
+            stock_df["Store_Name"].dropna().unique().tolist()
+        )
+
+        _tab_labels = ["🏬 All Stores"] + [
+            f"🏪 {s.split()[0]}"
+            for s in _all_stores_list
+        ]
+
+    else:
+
+        # Store owner sees only their store
+        _all_stores_list = [
+            st.session_state.user_store
+        ]
+
+        _tab_labels = [
+            f"🏪 {st.session_state.user_store.split()[0]}"
+        ]
+
     _checklist_tabs = st.tabs(_tab_labels)
 
-    # Tab 0 — All stores (aggregated, current filter)
-    with _checklist_tabs[0]:
-        _all_tasks = []
+    # Admin only — All Stores tab
+    if st.session_state.user_role == "admin":
+
+        with _checklist_tabs[0]:
+
+            _all_tasks = []
         if _exp7_skus > 0:
             _all_tasks.append(("🔴", (
                 f"<b>{_exp7_skus:,} SKUs</b> expiring in 7 days "
@@ -1671,10 +2115,29 @@ elif page == "☀️  Morning Briefing":
             _all_tasks.append(("🟢", f"<b>{_logged_actions} expiry actions</b> already logged today — review the Expiry Action table below"))
         st.markdown(f'<div style="margin:10px 0 18px">{_render_tasks_html(_all_tasks)}</div>', unsafe_allow_html=True)
 
-    # Tabs 1-N — one per store
-    for _ti, _sname in enumerate(_all_stores_list):
-        with _checklist_tabs[_ti + 1]:
+    # ── Store Specific Tabs ───────────────────────────────────────
+
+    if st.session_state.user_role == "admin":
+
+        for _ti, _sname in enumerate(_all_stores_list):
+
+            with _checklist_tabs[_ti + 1]:
+
+                _store_tasks = _build_store_tasks(_sname)
+
+                st.markdown(
+                    f'<div style="margin:10px 0 18px">{_render_tasks_html(_store_tasks)}</div>',
+                    unsafe_allow_html=True,
+                )
+
+    else:
+
+        _sname = st.session_state.user_store
+
+        with _checklist_tabs[0]:
+
             _store_tasks = _build_store_tasks(_sname)
+
             st.markdown(
                 f'<div style="margin:10px 0 18px">{_render_tasks_html(_store_tasks)}</div>',
                 unsafe_allow_html=True,
@@ -1721,8 +2184,6 @@ elif page == "☀️  Morning Briefing":
             from reportlab.platypus import SimpleDocTemplate, Table, TableStyle, Paragraph, Spacer
             from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
             from reportlab.lib.enums import TA_CENTER, TA_LEFT
-            import datetime as _dt2
-
             def _build_reorder_pdf(df_in, store_label):
                 _buf = _io.BytesIO()
                 doc = SimpleDocTemplate(_buf, pagesize=landscape(A4),
@@ -1738,7 +2199,7 @@ elif page == "☀️  Morning Briefing":
 
                 elems = []
                 elems.append(Paragraph("📦 Pharmacy Reorder List", _title_style))
-                _now2 = _dt2.datetime.now().strftime("%d %b %Y, %I:%M %p")
+                _now2 = datetime.datetime.now().strftime("%d %b %Y, %I:%M %p")
                 elems.append(Paragraph(f"Generated: {_now2}  ·  Store: {store_label}  ·  {len(df_in)} items", _sub_style))
                 elems.append(Spacer(1, 0.3*cm))
 
@@ -1791,7 +2252,7 @@ elif page == "☀️  Morning Briefing":
                 return _buf.getvalue()
 
             _pdf_bytes = _build_reorder_pdf(_ro_display, SEL_STORE if SEL_STORE != "All" else "All Stores")
-            _fname = f"Reorder_List_{(SEL_STORE if SEL_STORE != 'All' else 'AllStores').replace(' ','_')}_{_dt.datetime.now().strftime('%d%b%Y')}.pdf"
+            _fname = f"Reorder_List_{(SEL_STORE if SEL_STORE != 'All' else 'AllStores').replace(' ','_')}_{datetime.datetime.now().strftime('%d%b%Y')}.pdf"
             st.download_button(
                 label="⬇️ Download Reorder List as PDF",
                 data=_pdf_bytes,
@@ -1906,16 +2367,40 @@ elif page == "📊  Overview":
         render_chart(fig1, 370, key="ov_top_med")
 
     with c2:
-        sec("🏪 Top Performing Stores")
-        sr   = get_store_revenue(DR_MIN, DR_MAX, SEL_STORE, SEL_CAT)
-        fig2 = px.bar(sr, x="TotalAmount", y="Store_Name", orientation="h",
-                      color="TotalAmount", color_continuous_scale="Blues",
-                      text="TotalAmount",
-                      labels={"TotalAmount": "Revenue (₹)", "Store_Name": ""})
-        fig2.update_traces(texttemplate="₹%{text:,.0f}", textposition="outside")
-        fig2.update_layout(coloraxis_showscale=False,
-                           xaxis=dict(range=[0, sr["TotalAmount"].max() * 1.28]))
-        render_chart(fig2, 370, key="ov_store_rev")
+        _is_owner_view = st.session_state.user_role == "store_owner"
+        if _is_owner_view:
+            # Store owner: show Top 10 Products by Revenue for their store
+            sec("💊 Top Products by Revenue")
+            _top_prod = get_filtered_sales(DR_MIN, DR_MAX, SEL_STORE, SEL_CAT)
+            _top_prod = (
+                _top_prod.groupby("Medicine_Name", observed=True)["TotalAmount"]
+                .sum().sort_values(ascending=False).head(10).reset_index()
+            )
+            fig2 = px.bar(
+                _top_prod, x="TotalAmount", y="Medicine_Name", orientation="h",
+                color="TotalAmount", color_continuous_scale="Blues",
+                text="TotalAmount",
+                labels={"TotalAmount": "Revenue (₹)", "Medicine_Name": ""},
+            )
+            fig2.update_traces(texttemplate="₹%{text:,.0f}", textposition="outside")
+            fig2.update_layout(
+                coloraxis_showscale=False,
+                xaxis=dict(range=[0, _top_prod["TotalAmount"].max() * 1.30]),
+                yaxis=dict(categoryorder="total ascending"),
+            )
+            render_chart(fig2, 370, key="ov_top_prod_owner")
+        else:
+            # Admin: show all stores comparison
+            sec("🏪 Top Performing Stores")
+            sr   = get_store_revenue(DR_MIN, DR_MAX, SEL_STORE, SEL_CAT)
+            fig2 = px.bar(sr, x="TotalAmount", y="Store_Name", orientation="h",
+                          color="TotalAmount", color_continuous_scale="Blues",
+                          text="TotalAmount",
+                          labels={"TotalAmount": "Revenue (₹)", "Store_Name": ""})
+            fig2.update_traces(texttemplate="₹%{text:,.0f}", textposition="outside")
+            fig2.update_layout(coloraxis_showscale=False,
+                               xaxis=dict(range=[0, sr["TotalAmount"].max() * 1.28]))
+            render_chart(fig2, 370, key="ov_store_rev")
 
     c3, c4 = st.columns(2)
 
@@ -2128,8 +2613,8 @@ elif page == "🧪  Inventory & Expiry":
 
     styled = (
         sample.style
-        .applymap(lambda v: _EXPIRY_COLORS.get(v, ""), subset=["ExpiryStatus"])
-        .applymap(lambda v: _STOCK_COLORS.get(v, ""),  subset=["StockStatus"])
+        .map(lambda v: _EXPIRY_COLORS.get(v, ""), subset=["ExpiryStatus"])
+        .map(lambda v: _STOCK_COLORS.get(v, ""),  subset=["StockStatus"])
     )
     st.dataframe(styled, use_container_width=True, height=480)
 
@@ -2317,7 +2802,7 @@ elif page == "🏪  Supplier & Store":
 
     # KPIs — computed once, reused below
     n_sup    = int(fk["Supplier_Name"].nunique())
-    n_stores = int(store_df.shape[0])
+    n_stores = int(stock_df["Store_Name"].dropna().nunique())
     avg_lead = round(float(fk["LeadTimeDays"].mean()), 1)
     avg_rat  = round(float(fk["QualityRating"].mean()), 2)
 
@@ -2483,7 +2968,6 @@ elif page == "🏪  Supplier & Store":
     </div>
   </div>
 
-  <!-- Stock tally bar: Total = OOS + Expired + Current Stock -->
   <div style="background:rgba(21,101,192,0.05);border:1px solid rgba(21,101,192,0.15);
               border-radius:10px;padding:8px 12px;margin-bottom:10px">
     <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:5px">
@@ -2710,7 +3194,6 @@ elif page == "💡  Business Insights":
             unsafe_allow_html=True,
         )
         st.info(
-            "**To enable the AI assistant:**\n"
             "1. `pip install groq python-dotenv`\n"
             "2. Create `.env` → add `GROQ_API_KEY=your_key_here`\n"
             "3. Restart the app\n\n"
@@ -2863,17 +3346,11 @@ elif page == "💡  Business Insights":
                   border-radius:10px;display:flex;align-items:center;justify-content:center;
                   font-size:1.2rem">🤖</div>
       <div>
-        <div style="font-size:1.05rem;font-weight:800;color:#0b3d6e">AI Assistant</div>
-        <div style="font-size:0.72rem;color:#4a6a8a">Powered by your live pharmacy data</div>
       </div>
     </div>""", unsafe_allow_html=True)
 
     # ── suggestion chips ──────────────────────────────────────────────────────
     _suggestions = [
-        "Which medicines need reordering?",
-        "Which supplier is underperforming?",
-        "Which category has highest expiry risk?",
-        "How can revenue improve?",
     ]
     _chip_html = "".join([
         f'<span style="display:inline-block;background:rgba(21,101,192,0.09);'
@@ -2884,7 +3361,6 @@ elif page == "💡  Business Insights":
     ])
     st.markdown(
         f'<div style="margin-bottom:14px"><span style="font-size:0.7rem;font-weight:700;'
-        f'color:#4a6a8a;text-transform:uppercase;letter-spacing:0.5px">Try asking: </span>'
         f'{_chip_html}</div>',
         unsafe_allow_html=True
     )
@@ -2897,7 +3373,6 @@ elif page == "💡  Business Insights":
             '<div style="text-align:center;padding:28px;background:rgba(21,101,192,0.04);'
             'border-radius:12px;border:1.5px dashed rgba(21,101,192,0.2);margin-bottom:14px">'
             '<div style="font-size:1.6rem;margin-bottom:6px">💬</div>'
-            '<div style="font-size:0.85rem;color:#4a6a8a;font-weight:600">No conversation yet</div>'
             '<div style="font-size:0.75rem;color:#7a9ab0;margin-top:3px">Ask a question below to get started</div>'
             '</div>',
             unsafe_allow_html=True
@@ -2928,7 +3403,6 @@ elif page == "💡  Business Insights":
                     f'font-size:0.84rem;line-height:1.65;color:#1a2a3a;flex:1;'
                     f'box-shadow:0 2px 8px rgba(21,101,192,0.08)">'
                     f'<span style="font-size:0.68rem;font-weight:700;color:#1565C0;'
-                    f'text-transform:uppercase;letter-spacing:0.5px;display:block;margin-bottom:6px">AI Assistant</span>'
                     f'{_rendered}</div></div>',
                     unsafe_allow_html=True,
                 )
@@ -2941,7 +3415,6 @@ elif page == "💡  Business Insights":
     )
     user_q = st.text_input(
         "Your question",
-        placeholder="💬  Ask anything about your pharmacy data…",
         key="ai_chat_input",
         label_visibility="collapsed",
     )
@@ -2949,7 +3422,6 @@ elif page == "💡  Business Insights":
     with _btn_col1:
         ask_btn = st.button("➤ Ask", key="btn_ask_ai", type="primary", use_container_width=True)
     with _btn_col2:
-        if st.button("🗑️ Clear Chat", key="btn_clear_chat", type="secondary", use_container_width=True):
             st.session_state["ai_chat_history"] = []
             st.rerun()
     st.markdown("</div>", unsafe_allow_html=True)
@@ -3056,7 +3528,6 @@ elif page == "ℹ️  About":
             <li>📈 <b>Sales & Demand</b> — Monthly trends, top-10 medicines, category splits, Rx vs OTC proxy.</li>
             <li>🏪 <b>Supplier & Store</b> — Map view, supplier ratings, store performance.</li>
             <li>💡 <b>Business Insights</b> — Store underperformance alerts, below-cost category flags, consolidated recommendations.</li>
-            <li>🤖 <b>AI Assistant</b> — Groq-powered Llama chat for instant analytics Q&A.</li>
             <li>💰 <b>Net Profit View</b> — Revenue vs COGS vs Wastage per store.</li>
             <li>🔽 <b>Smart Filters</b> — Instant filter + one-click clear, Excel export.</li>
             <li>⚡ <b>Cached Aggregations</b> — Fast reruns with <code>@st.cache_data</code>.</li>
@@ -3089,3 +3560,1397 @@ elif page == "ℹ️  About":
       </p>
     </div>
     """, unsafe_allow_html=True)
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# ═══════════════════════════════════════════════════════════════════════════════
+    st.markdown('<div class="page-title">🤖 AI Pharmacy Assistant</div>', unsafe_allow_html=True)
+
+    kpis = get_overview_kpis(DR_MIN, DR_MAX, SEL_STORE, SEL_CAT, SEL_SUP, SEL_STS)
+    exp_kpis_ai = get_inventory_expiry_kpis(SEL_STORE, SEL_CAT, SEL_SUP, SEL_STS)
+    wastage_ai  = exp_kpis_ai["wastage"]
+    _ai_ctx = _build_ai_context(
+        DR_MIN, DR_MAX, SEL_STORE, SEL_CAT, SEL_SUP, SEL_STS,
+        kpis["total_rev"], kpis["total_sv"], kpis["low_stock"],
+        kpis["safe_pct"], wastage_ai, exp_kpis_ai,
+    )
+
+    st.markdown("""
+    <div style="background:linear-gradient(135deg,rgba(21,101,192,0.88),rgba(0,188,212,0.82));
+                border-radius:16px;padding:22px 26px;margin-bottom:18px;
+                box-shadow:0 6px 24px rgba(21,101,192,0.28)">
+      <div style="display:flex;align-items:center;gap:14px">
+        <div style="font-size:2.5rem;filter:drop-shadow(0 2px 8px rgba(0,0,0,0.30))">🤖</div>
+        <div>
+          <div style="font-family:'Rajdhani',sans-serif;font-size:1.4rem;font-weight:700;
+          <div style="font-size:0.82rem;color:rgba(255,255,255,0.80)">
+          </div>
+        </div>
+      </div>
+    </div>""", unsafe_allow_html=True)
+
+    import re as _re_ai
+    def _md_to_html_ai(text: str) -> str:
+        text = text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+        text = _re_ai.sub(r"^### (.+)$",
+            r'<h4 style="margin:14px 0 4px;color:#0b3d6e;font-size:0.95rem">\1</h4>',
+            text, flags=_re_ai.MULTILINE)
+        text = _re_ai.sub(r"^## (.+)$",
+            r'<h3 style="margin:16px 0 6px;color:#0b3d6e;font-size:1.05rem">\1</h3>',
+            text, flags=_re_ai.MULTILINE)
+        text = _re_ai.sub(r"\*\*(.+?)\*\*", r'<strong style="color:#0b3d6e">\1</strong>', text)
+        text = _re_ai.sub(r"\*(.+?)\*", r'<em style="color:#1a5276">\1</em>', text)
+        def _make_li(m):
+            return (f'<li style="margin:4px 0;padding-left:10px;'
+                    f'border-left:3px solid #42A5F5;list-style:none">{m.group(1)}</li>')
+        text = _re_ai.sub(r"^[*\-] (.+)$", _make_li, text, flags=_re_ai.MULTILINE)
+        text = text.replace("\n", "<br>")
+        return text
+
+    _chat_history = st.session_state.get("ai_chat_history", [])
+    if _chat_history:
+        for _msg in _chat_history:
+            if _msg["role"] == "user":
+                st.markdown(
+                    f'<div style="display:flex;justify-content:flex-end;margin-bottom:8px">'
+                    f'<div style="background:linear-gradient(135deg,rgba(21,101,192,0.88),rgba(30,136,229,0.84));'
+                    f'border-radius:16px 4px 16px 16px;padding:12px 16px;max-width:75%;'
+                    f'font-size:0.84rem;color:#fff;box-shadow:0 2px 8px rgba(21,101,192,0.20)">'
+                    f'{_msg["content"]}</div></div>',
+                    unsafe_allow_html=True,
+                )
+            else:
+                _rendered = _md_to_html_ai(_msg["content"])
+                st.markdown(
+                    f'<div style="display:flex;align-items:flex-start;gap:8px;margin-bottom:12px">'
+                    f'<div style="font-size:1.5rem;margin-top:4px">🤖</div>'
+                    f'<div style="background:rgba(227,242,253,0.95);border:1px solid rgba(21,101,192,0.18);'
+                    f'border-radius:4px 16px 16px 16px;padding:14px 18px;flex:1;'
+                    f'font-size:0.84rem;line-height:1.65;color:#1a2a3a;'
+                    f'box-shadow:0 2px 8px rgba(21,101,192,0.08)">'
+                    f'<span style="font-size:0.68rem;font-weight:700;color:#1565C0;'
+                    f'{_rendered}</div></div>',
+                    unsafe_allow_html=True,
+                )
+
+    st.markdown(
+        '<div style="background:rgba(21,101,192,0.04);border:1.5px solid rgba(21,101,192,0.20);'
+        'border-radius:12px;padding:10px 12px;margin-top:4px">',
+        unsafe_allow_html=True
+    )
+    user_q_ai = st.text_input(
+        "Your question",
+        key="ai_standalone_input",
+        label_visibility="collapsed",
+    )
+    _bc1, _bc2 = st.columns([1, 3])
+    with _bc1:
+        ask_btn_ai = st.button("Ask", key="btn_ask_ai_standalone", type="primary", use_container_width=True)
+    with _bc2:
+            st.session_state["ai_chat_history"] = []
+            st.rerun()
+    st.markdown("</div>", unsafe_allow_html=True)
+
+    if ask_btn_ai and user_q_ai.strip():
+        _flat = tuple(m["content"] for m in _chat_history)
+        with st.spinner("Thinking…"):
+            _res = generate_ai_insights(_ai_ctx, user_question=user_q_ai.strip(), chat_history=_flat)
+        st.session_state["ai_chat_history"].append({"role": "user",      "content": user_q_ai.strip()})
+        st.session_state["ai_chat_history"].append({"role": "assistant", "content": _res})
+        st.rerun()
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# PAGE — ADMIN PANEL  (admin role only)
+# ═══════════════════════════════════════════════════════════════════════════════
+elif page == "🔐  Admin Panel":
+    if st.session_state.user_role != "admin":
+        st.error("⛔ Access denied. This page is restricted to administrators.")
+        st.stop()
+
+    st.markdown('<div class="page-title">🔐 Admin Control Panel</div>', unsafe_allow_html=True)
+
+    # Hero banner
+    st.markdown(f"""
+    <div style="background:linear-gradient(135deg,rgba(183,28,28,0.88),rgba(229,57,53,0.82));
+                border-radius:20px;padding:24px 30px;margin-bottom:22px;
+                box-shadow:0 8px 32px rgba(183,28,28,0.30);
+                display:flex;align-items:center;gap:18px">
+      <div style="font-size:3rem;filter:drop-shadow(0 3px 10px rgba(0,0,0,0.30))">🛡️</div>
+      <div>
+        <div style="font-family:'Rajdhani',sans-serif;font-size:1.5rem;font-weight:700;
+                    color:#fff;letter-spacing:1.5px">ADMIN CONTROL PANEL</div>
+        <div style="font-size:0.82rem;color:rgba(255,255,255,0.80);margin-top:4px">
+          Logged in as <b>{st.session_state.user_name}</b> · Full system access
+        </div>
+      </div>
+    </div>""", unsafe_allow_html=True)
+
+    # System KPIs
+    _total_users = 5
+    _active_roles = len(set(u["role"] for u in _USERS.values()))
+    _role_counts  = {}
+    for _u in _USERS.values():
+        _role_counts[_u["role"]] = _role_counts.get(_u["role"], 0) + 1
+
+    st.markdown(f"""<div class="kpi-row">
+        {kpi(str(_total_users),   "Total Users")}
+        {kpi(str(_active_roles),  "Active Roles")}
+        {kpi(str(len(STORES)),    "Stores Monitored")}
+    </div>""", unsafe_allow_html=True)
+
+    _tab1, _tab2 = st.tabs([
+    "👥 User Access",
+    "⚙️ System Controls"
+])
+
+    # ── Tab 1: User Management ─────────────────────────────────────────────────
+    with _tab1:
+        st.markdown('<div class="sec-title">👥 Registered Users</div>', unsafe_allow_html=True)
+        for _uname, _udata in _USERS.items():
+            _rbg2 = _role_badge_colors.get(_udata["role"], "#1976D2")
+            st.markdown(f"""
+            <div style="background:rgba(255,255,255,0.72);border:1px solid rgba(255,255,255,0.55);
+                        border-radius:14px;padding:16px 20px;margin-bottom:10px;
+                        box-shadow:0 3px 14px rgba(21,101,192,0.07);
+                        display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:12px">
+              <div style="display:flex;align-items:center;gap:14px">
+                <div style="font-size:2rem;line-height:1">{_udata['avatar']}</div>
+                <div>
+                  <div style="font-weight:800;font-size:0.95rem;color:#0b3d6e">{_udata['name']}</div>
+                  <div style="font-size:0.78rem;color:#4a6a8a;margin-top:2px">
+                    Username: <b>{_uname}</b>
+                  </div>
+                </div>
+              </div>
+              <div style="display:flex;align-items:center;gap:10px;flex-wrap:wrap">
+                <div style="background:{_rbg2};color:#fff;font-size:0.68rem;font-weight:800;
+                            letter-spacing:1px;padding:3px 12px;border-radius:20px;text-transform:uppercase">
+                  {_udata['role']}
+                </div>
+                <div style="background:rgba(21,101,192,0.10);color:#0b3d6e;font-size:0.75rem;
+                            font-weight:700;padding:4px 12px;border-radius:10px">
+                  🏪 {_udata['store']}
+                </div>
+                <div style="background:rgba(67,160,71,0.15);color:#2E7D32;font-size:0.72rem;
+                            font-weight:700;padding:4px 12px;border-radius:10px">
+                  ✅ Active
+                </div>
+              </div>
+            </div>""", unsafe_allow_html=True)
+
+        st.markdown('<div class="sec-title">🔑 Credential Reference</div>', unsafe_allow_html=True)
+        _cred_rows = []
+        _plain_pw = {
+            "admin": "Admin@2026",
+            "medplus_store": "MedPlus@001",
+            "apollo_store": "Apollo@002",
+            "wellcare_store": "WellCare@003",
+            "healthfirst_store": "Health@004",
+            "citymed_store": "CityMed@005",
+        }
+        for _uname, _udata in _USERS.items():
+            _cred_rows.append({
+                "Avatar": _udata["avatar"],
+                "Username": _uname,
+                "Password": _plain_pw.get(_uname, "••••••••"),
+                "Role": _udata["role"].upper().replace("_", " "),
+                "Name": _udata["name"],
+                "Store Access": _udata["store"],
+            })
+        st.dataframe(
+            pd.DataFrame(_cred_rows),
+            use_container_width=True,
+            hide_index=True,
+        )
+
+    # ── Tab 2: Role Permissions ─────────────────────────────────────────────────
+    with _tab2:
+        st.markdown('<div class="sec-title">🔐 Role-Based Access Control</div>', unsafe_allow_html=True)
+        for _role, _pages in _ROLE_PAGES.items():
+            _rbg3 = _role_badge_colors.get(_role, "#1976D2")
+            _chips = ""
+            for _p in _pages:
+                _chips += (
+                    f'<span style="display:inline-block;margin:3px 4px 3px 0;padding:4px 10px;'
+                    f'border-radius:20px;font-size:0.72rem;font-weight:700;'
+                    f'background:rgba(67,160,71,0.15);'
+                    f'color:#2E7D32;'
+                    f'border:1px solid rgba(67,160,71,0.35)">'
+                    f'✓ {_p}</span>'
+                )
+            st.markdown(f"""
+            <div style="background:rgba(255,255,255,0.72);border:1px solid rgba(255,255,255,0.55);
+                        border-radius:14px;padding:16px 20px;margin-bottom:12px;
+                        box-shadow:0 3px 14px rgba(21,101,192,0.07)">
+              <div style="display:flex;align-items:center;gap:10px;margin-bottom:12px">
+                <span style="background:{_rbg3};color:#fff;font-size:0.72rem;font-weight:800;
+                             letter-spacing:1.2px;padding:4px 14px;border-radius:20px;text-transform:uppercase">
+                  {_role.replace("_", " ")}
+                </span>
+                <span style="font-size:0.80rem;color:#4a6a8a;font-weight:600">
+                  {len(_pages)} pages accessible
+                </span>
+              </div>
+              <div>{_chips}</div>
+            </div>""", unsafe_allow_html=True)
+
+    # ═══════════════════════════════════════════════════════════════════════════════
+# PAGE — SUBSCRIBERS  (admin role only)
+# ═══════════════════════════════════════════════════════════════════════════════
+elif page == "👥  Subscribers":
+    if st.session_state.user_role != "admin":
+        st.error("⛔ Access denied. This page is restricted to administrators.")
+        st.stop()
+
+    st.markdown('<div class="page-title">👥 Subscriber Management</div>', unsafe_allow_html=True)
+
+    # ── Static subscriber data (representative sample) ────────────────────────
+    _PLANS = {
+        "Starter":      {"price": 299,   "color": "#43A047", "bg": "rgba(67,160,71,0.12)",   "features": "1 Store · Basic Reports · Email Support"},
+        "Professional": {"price": 799,   "color": "#1976D2", "bg": "rgba(25,118,210,0.12)",  "features": "3 Stores · AI Insights · Priority Support"},
+        "Enterprise":   {"price": 1999,  "color": "#7B1FA2", "bg": "rgba(123,31,162,0.12)",  "features": "Unlimited Stores · Full Suite · Dedicated Manager"},
+    }
+
+    
+    _SUBSCRIBERS = [
+    {
+        "id": "SUB001",
+        "name": "MedPlus Ameerpet",
+        "store": "MedPlus Ameerpet",
+        "email": "medplus@pharmadash.in",
+        "plan": "Professional",
+        "from": "2026-01-15",
+        "to": "2027-01-14",
+        "status": "Active",
+        "avatar": "🏪",
+        "role": "store_owner"
+    },
+    
+    {
+        "id": "SUB002",
+        "name": "Apollo Kukatpally",
+        "store": "Apollo Kukatpally",
+        "email": "apollo@pharmadash.in",
+        "plan": "Enterprise",
+        "from": "2026-02-01",
+        "to": "2027-02-01",
+        "status": "Active",
+        "avatar": "🏥",
+        "role": "store_owner"
+    },
+    
+    {
+        "id": "SUB003",
+        "name": "WellCare Banjara Hills",
+        "store": "WellCare Banjara Hills",
+        "email": "wellcare@pharmadash.in",
+        "plan": "Starter",
+        "from": "2026-03-01",
+        "to": "2027-03-01",
+        "status": "Active",
+        "avatar": "🩺",
+        "role": "store_owner"
+    },
+    
+    {
+        "id": "SUB004",
+        "name": "HealthFirst Madhapur",
+        "store": "HealthFirst Madhapur",
+        "email": "healthfirst@pharmadash.in",
+        "plan": "Professional",
+        "from": "2026-01-20",
+        "to": "2027-01-20",
+        "status": "Active",
+        "avatar": "💉",
+        "role": "store_owner"
+    },
+    
+    {
+        "id": "SUB005",
+        "name": "CityMed Dilsukhnagar",
+        "store": "CityMed Dilsukhnagar",
+        "email": "citymed@pharmadash.in",
+        "plan": "Enterprise",
+        "from": "2026-02-15",
+        "to": "2027-02-15",
+        "status": "Active",
+        "avatar": "🧬",
+        "role": "store_owner"
+    }
+    ]
+
+
+    _sub_df = pd.DataFrame(_SUBSCRIBERS)
+    _sub_df["from_dt"] = pd.to_datetime(_sub_df["from"])
+    _sub_df["to_dt"]   = pd.to_datetime(_sub_df["to"])
+    _today = datetime.date.today()
+
+    # ── Revenue computation ───────────────────────────────────────────────────
+    def _plan_rev(row):
+        p = _PLANS.get(row["plan"], {})
+        price = p.get("price", 0)
+        months = max(1, round((row["to_dt"] - row["from_dt"]).days / 30))
+        return price * months
+
+    _sub_df["revenue"] = _sub_df.apply(_plan_rev, axis=1)
+
+    _total_subs    = len(_sub_df)
+    _active_subs   = len(_sub_df[_sub_df["status"] == "Active"])
+    _expired_subs  = len(_sub_df[_sub_df["status"] == "Expired"])
+    _expiring_subs = len(_sub_df[_sub_df["status"] == "Expiring Soon"])
+    _total_rev_sub = _sub_df["revenue"].sum()
+    _active_rev    = _sub_df[_sub_df["status"] == "Active"]["revenue"].sum()
+
+    # ── KPI banner ─────────────────────────────────────────────────────────────
+    st.markdown(f"""
+    <div style="background:linear-gradient(135deg,rgba(21,101,192,0.90),rgba(13,61,110,0.92));
+                border-radius:20px;padding:24px 30px;margin-bottom:22px;
+                box-shadow:0 8px 32px rgba(21,101,192,0.28);
+                display:flex;align-items:center;gap:18px">
+      <div style="font-size:2.8rem;filter:drop-shadow(0 3px 10px rgba(0,0,0,0.30))">👥</div>
+      <div style="flex:1">
+        <div style="font-family:'Rajdhani',sans-serif;font-size:1.5rem;font-weight:700;
+                    color:#fff;letter-spacing:1.5px">SUBSCRIBER MANAGEMENT</div>
+        <div style="font-size:0.82rem;color:rgba(255,255,255,0.75);margin-top:4px">
+          Track plans, validity, and revenue across all registered subscribers
+        </div>
+      </div>
+      <div style="text-align:right">
+        <div style="font-family:'Rajdhani',sans-serif;font-size:1.9rem;font-weight:700;color:#fff">
+          ₹{_total_rev_sub:,.0f}
+        </div>
+        <div style="font-size:0.72rem;color:rgba(255,255,255,0.60);letter-spacing:1px">TOTAL CONTRACT VALUE</div>
+      </div>
+    </div>""", unsafe_allow_html=True)
+
+    # ── Summary KPIs ───────────────────────────────────────────────────────────
+    st.markdown(f"""<div class="kpi-row">
+      {kpi(str(_total_subs),               "Total Subscribers")}
+      {kpi(str(_active_subs),              "Active",          "ok")}
+      {kpi(str(_expired_subs),             "Expired",         "warn")}
+      {kpi(str(_expiring_subs),            "Expiring Soon",   "teal")}
+      {kpi("₹"+fmt(_active_rev),           "Active Revenue",  "ok")}
+    </div>""", unsafe_allow_html=True)
+
+    # ── Tabs ───────────────────────────────────────────────────────────────────
+    _stab1, _stab2, _stab3 = st.tabs(["📋 All Subscribers", "📊 Plan & Revenue Analytics", "⚠️ Expiry Alerts"])
+
+    # ── Tab 1: All Subscribers ─────────────────────────────────────────────────
+    with _stab1:
+        sec("👥 Registered Subscribers")
+
+        # Filter bar
+        _sf_col1, _sf_col2, _sf_col3 = st.columns([2, 2, 2])
+        with _sf_col1:
+            _plan_filter = st.selectbox("Filter by Plan", ["All"] + list(_PLANS.keys()), key="sub_plan_filter")
+        with _sf_col2:
+            _status_filter = st.selectbox("Filter by Status", ["All", "Active", "Expired", "Expiring Soon"], key="sub_status_filter")
+        with _sf_col3:
+            _search_filter = st.text_input("🔍 Search by name or store", placeholder="Type to search…", key="sub_search")
+
+        _disp_df = _sub_df.copy()
+        if _plan_filter   != "All": _disp_df = _disp_df[_disp_df["plan"] == _plan_filter]
+        if _status_filter != "All": _disp_df = _disp_df[_disp_df["status"] == _status_filter]
+        if _search_filter.strip():
+            _q = _search_filter.strip().lower()
+            _disp_df = _disp_df[
+                _disp_df["name"].str.lower().str.contains(_q) |
+                _disp_df["store"].str.lower().str.contains(_q)
+            ]
+
+        st.markdown(f"<div style='font-size:0.78rem;color:#4a6a8a;margin-bottom:10px'>Showing <b>{len(_disp_df)}</b> of {_total_subs} subscribers</div>", unsafe_allow_html=True)
+
+        for _, _row in _disp_df.iterrows():
+            _pdata  = _PLANS.get(_row["plan"], {})
+            _pclr   = _pdata.get("color", "#1976D2")
+            _pbg    = _pdata.get("bg", "rgba(25,118,210,0.10)")
+            _pprice = _pdata.get("price", 0)
+            _pfeat  = _pdata.get("features", "")
+
+            _sts = _row["status"]
+            _sclr = {"Active": "#43A047", "Expired": "#E53935", "Expiring Soon": "#FB8C00"}.get(_sts, "#1976D2")
+            _sbg  = {"Active": "rgba(67,160,71,0.12)", "Expired": "rgba(229,57,53,0.10)", "Expiring Soon": "rgba(251,140,0,0.12)"}.get(_sts, "rgba(25,118,210,0.10)")
+
+            _days_left = (_row["to_dt"].date() - _today).days
+            _days_txt  = f"{_days_left}d left" if _days_left > 0 else "Expired"
+
+            _is_admin   = _row.get("role","") == "admin"
+            _price_disp = "Lifetime" if _pprice == 0 else f"₹{_pprice:,}/mo"
+            _card_border = "1.5px solid rgba(229,57,53,0.40)" if _is_admin else "1.5px solid rgba(255,255,255,0.60)"
+            _card_bg     = "rgba(255,245,245,0.88)" if _is_admin else "rgba(255,255,255,0.82)"
+            _rev_disp    = "—" if _pprice == 0 else f"₹{_row['revenue']:,.0f}"
+
+            # Role badge
+            _role_lbl  = {"admin": "Super Admin", "store_owner": "Store Owner"}.get(_row.get("role",""), "User")
+            _role_clr  = {"admin": "#E53935", "store_owner": "#1976D2"}.get(_row.get("role",""), "#555")
+            _role_bg   = {"admin": "rgba(229,57,53,0.10)", "store_owner": "rgba(25,118,210,0.10)"}.get(_row.get("role",""), "rgba(0,0,0,0.06)")
+
+            # Pre-build hex-suffix colours (avoid f-string format-spec clash e.g. {_pclr}40)
+            _pclr40 = _pclr + "40"
+            _sclr50 = _sclr + "50"
+
+            st.markdown(f"""
+            <div style="background:{_card_bg};border:{_card_border};
+                        border-radius:14px;padding:16px 20px;margin-bottom:10px;
+                        box-shadow:{'0 4px 18px rgba(229,57,53,0.12)' if _is_admin else '0 3px 14px rgba(21,101,192,0.07)'}">
+              <div style="display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:12px">
+                <div style="display:flex;align-items:center;gap:14px">
+                  <div style="font-size:2rem;width:46px;height:46px;
+                              background:{'rgba(229,57,53,0.10)' if _is_admin else 'rgba(21,101,192,0.08)'};
+                              border-radius:12px;display:flex;align-items:center;justify-content:center">
+                    {_row['avatar']}
+                  </div>
+                  <div>
+                    <div style="display:flex;align-items:center;gap:8px">
+                      <span style="font-weight:800;font-size:0.96rem;color:#0b3d6e">{_row['name']}</span>
+                      <span style="background:{_role_bg};color:{_role_clr};font-size:0.64rem;font-weight:800;
+                                   padding:2px 8px;border-radius:12px;letter-spacing:0.5px;text-transform:uppercase">
+                        {_role_lbl}
+                      </span>
+                    </div>
+                    <div style="font-size:0.76rem;color:#4a6a8a;margin-top:1px">🏪 {_row['store']}</div>
+                    <div style="font-size:0.72rem;color:#a0b8cc;margin-top:1px">📧 {_row['email']}</div>
+                  </div>
+                </div>
+                <div style="display:flex;flex-direction:column;gap:6px;min-width:200px">
+                  <div style="display:flex;align-items:center;gap:8px">
+                    <span style="background:{_pbg};color:{_pclr};font-size:0.72rem;font-weight:800;
+                                 padding:3px 12px;border-radius:20px;border:1px solid {_pclr40};
+                                 letter-spacing:0.5px">⭐ {_row['plan']}</span>
+                    <span style="font-size:0.72rem;font-weight:700;color:#4a6a8a">{_price_disp}</span>
+                  </div>
+                  <div style="font-size:0.74rem;color:#4a6a8a">
+                    📅 <b>{_row['from']}</b> → <b>{'No Expiry' if _is_admin else _row['to']}</b>
+                  </div>
+                  <div style="font-size:0.70rem;color:#7a9ab8">{_pfeat}</div>
+                </div>
+                <div style="text-align:right">
+                  <div style="background:{_sbg};color:{_sclr};font-size:0.72rem;font-weight:800;
+                              padding:4px 14px;border-radius:20px;border:1px solid {_sclr50};
+                              display:inline-block;margin-bottom:6px">{_sts}</div>
+                  <div style="font-family:'Rajdhani',sans-serif;font-size:1.3rem;font-weight:700;
+                              color:#0b3d6e">{_rev_disp}</div>
+                  <div style="font-size:0.68rem;color:#a0b8cc">{'System Account' if _is_admin else 'Contract value'}</div>
+                  <div style="font-size:0.70rem;color:{_sclr};font-weight:700;margin-top:2px">
+                    {'♾️ Lifetime Access' if _is_admin else _days_txt}
+                  </div>
+                </div>
+              </div>
+              <div style="margin-top:8px;padding-top:8px;border-top:1px solid rgba(21,101,192,0.08)">
+                <span style="font-size:0.66rem;color:#a0b8cc;font-weight:700">ID: {_row['id']}</span>
+                {'<span style="margin-left:10px;font-size:0.66rem;background:rgba(229,57,53,0.10);color:#E53935;font-weight:800;padding:1px 8px;border-radius:8px">SYSTEM</span>' if _is_admin else ''}
+              </div>
+            </div>""", unsafe_allow_html=True)
+
+    # ── Tab 2: Plan & Revenue Analytics ───────────────────────────────────────
+    with _stab2:
+        sec("📊 Plan Distribution & Revenue Breakdown")
+
+        _col_a, _col_b = st.columns(2)
+
+        with _col_a:
+            # Plan count pie
+            _plan_counts = _sub_df["plan"].value_counts().reset_index()
+            _plan_counts.columns = ["Plan", "Count"]
+            _fig_plan = px.pie(
+                _plan_counts, names="Plan", values="Count",
+                title="Subscribers by Plan",
+                color_discrete_sequence=["#43A047", "#1976D2", "#7B1FA2"],
+                hole=0.42,
+            )
+            render_chart(_fig_plan, h=280, key="sub_plan_pie")
+
+        with _col_b:
+            # Revenue by plan bar
+            _rev_by_plan = _sub_df.groupby("plan")["revenue"].sum().reset_index()
+            _rev_by_plan.columns = ["Plan", "Revenue"]
+            _fig_rev = px.bar(
+                _rev_by_plan, x="Plan", y="Revenue",
+                title="Revenue by Plan (₹)",
+                color="Plan",
+                color_discrete_sequence=["#43A047", "#1976D2", "#7B1FA2"],
+                text_auto=True,
+            )
+            _fig_rev.update_traces(texttemplate="₹%{y:,.0f}", textposition="outside")
+            render_chart(_fig_rev, h=280, key="sub_rev_bar")
+
+        sec("📅 Subscription Timeline")
+
+        # Monthly revenue from subscriptions
+        _sub_df["month_label"] = _sub_df["from_dt"].dt.strftime("%b %Y")
+        _sub_df["month_num"]   = _sub_df["from_dt"].dt.to_period("M").apply(lambda p: p.ordinal)
+        _monthly_sub = (_sub_df.groupby(["month_num", "month_label"])["revenue"]
+                        .sum().reset_index().sort_values("month_num"))
+        _fig_timeline = px.line(
+            _monthly_sub, x="month_label", y="revenue",
+            title="Monthly Subscription Revenue (by Join Date)",
+            markers=True,
+            color_discrete_sequence=["#1976D2"],
+        )
+        _fig_timeline.update_traces(line_width=2.5, marker_size=7)
+        _fig_timeline.update_layout(xaxis_title="Month", yaxis_title="Revenue (₹)")
+        render_chart(_fig_timeline, h=260, key="sub_timeline")
+
+        # Big Revenue Card
+        _total_sub_rev = _sub_df["revenue"].sum()
+        _active_sub_rev = _sub_df[_sub_df["status"] == "Active"]["revenue"].sum()
+        _active_count = len(_sub_df[_sub_df["status"] == "Active"])
+        st.markdown(f"""
+        <div style="background:linear-gradient(135deg,#1565C0 0%,#0d3d7a 60%,#00838f 100%);
+                    border-radius:20px;padding:36px 40px;margin:24px 0 8px;
+                    box-shadow:0 8px 32px rgba(21,101,192,0.32);
+                    display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:24px">
+          <div>
+            <div style="font-size:0.70rem;font-weight:800;color:rgba(255,255,255,0.60);
+                        letter-spacing:2.5px;margin-bottom:10px">TOTAL SUBSCRIPTION REVENUE</div>
+            <div style="font-family:'Rajdhani',sans-serif;font-size:3.2rem;font-weight:700;
+                        color:#fff;letter-spacing:1px;line-height:1">₹ {_total_sub_rev:,.0f}</div>
+            <div style="font-size:0.78rem;color:rgba(255,255,255,0.60);margin-top:8px">
+              All plans · {len(_sub_df)} total subscribers
+            </div>
+          </div>
+          <div style="display:flex;gap:32px;flex-wrap:wrap">
+            <div style="text-align:center">
+              <div style="font-size:0.65rem;font-weight:800;color:rgba(255,255,255,0.55);
+                          letter-spacing:2px;margin-bottom:6px">ACTIVE REVENUE</div>
+              <div style="font-family:'Rajdhani',sans-serif;font-size:1.9rem;font-weight:700;
+                          color:#80d8ff">₹ {_active_sub_rev:,.0f}</div>
+              <div style="font-size:0.72rem;color:rgba(255,255,255,0.50);margin-top:4px">{_active_count} active subs</div>
+            </div>
+            <div style="text-align:center">
+              <div style="font-size:0.65rem;font-weight:800;color:rgba(255,255,255,0.55);
+                          letter-spacing:2px;margin-bottom:6px">AVG PER SUB</div>
+              <div style="font-family:'Rajdhani',sans-serif;font-size:1.9rem;font-weight:700;
+                          color:#b2ebf2">₹ {(_total_sub_rev / max(len(_sub_df),1)):,.0f}</div>
+              <div style="font-size:0.72rem;color:rgba(255,255,255,0.50);margin-top:4px">per subscriber</div>
+            </div>
+          </div>
+        </div>
+        """, unsafe_allow_html=True)
+
+    # ── Tab 3: Expiry Alerts ───────────────────────────────────────────────────
+    with _stab3:
+        sec("⚠️ Subscription Expiry Monitor")
+
+        # Expired
+        _exp_subs = _sub_df[_sub_df["status"] == "Expired"]
+        # Expiring within 30 days (includes "Expiring Soon")
+        _exp_soon = _sub_df[
+            (_sub_df["to_dt"].apply(lambda d: d.date()) >= _today) &
+            (_sub_df["to_dt"].apply(lambda d: d.date()) <= (_today + datetime.timedelta(days=30)))
+        ]
+
+        _ea1, _ea2, _ea3 = st.columns(3)
+        with _ea1:
+            st.markdown(f"""<div class="kpi-card warn">
+              <div class="val">{len(_exp_subs)}</div>
+              <div class="lbl">Expired Subscriptions</div>
+            </div>""", unsafe_allow_html=True)
+        with _ea2:
+            st.markdown(f"""<div class="kpi-card" style="background:linear-gradient(135deg,rgba(251,140,0,0.88),rgba(255,167,38,0.86))">
+              <div class="val">{len(_exp_soon)}</div>
+              <div class="lbl">Expiring in 30 Days</div>
+            </div>""", unsafe_allow_html=True)
+        with _ea3:
+            _rev_at_risk = _exp_soon["revenue"].sum() + _exp_subs["revenue"].sum()
+            st.markdown(f"""<div class="kpi-card teal">
+              <div class="val">₹{fmt(_rev_at_risk)}</div>
+              <div class="lbl">Revenue at Risk</div>
+            </div>""", unsafe_allow_html=True)
+
+        if len(_exp_subs) > 0:
+            st.markdown('<div class="sec-title">🔴 Expired Subscriptions — Renewal Required</div>', unsafe_allow_html=True)
+            for _, _row in _exp_subs.iterrows():
+                _pclr = _PLANS.get(_row["plan"], {}).get("color", "#E53935")
+                st.markdown(f"""
+                <div style="background:rgba(229,57,53,0.06);border:1.5px solid rgba(229,57,53,0.25);
+                            border-radius:12px;padding:14px 18px;margin-bottom:8px;
+                            display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:10px">
+                  <div style="display:flex;align-items:center;gap:12px">
+                    <span style="font-size:1.6rem">{_row['avatar']}</span>
+                    <div>
+                      <div style="font-weight:800;font-size:0.92rem;color:#c62828">{_row['name']}</div>
+                      <div style="font-size:0.75rem;color:#4a6a8a">{_row['store']}</div>
+                    </div>
+                  </div>
+                  <div style="font-size:0.78rem;color:#4a6a8a">
+                    Expired: <b style="color:#E53935">{_row['to']}</b>
+                  </div>
+                  <div>
+                    <span style="background:rgba(229,57,53,0.12);color:#E53935;font-size:0.72rem;
+                                 font-weight:800;padding:3px 12px;border-radius:20px;border:1px solid rgba(229,57,53,0.30)">
+                      {_row['plan']}
+                    </span>
+                  </div>
+                  <div style="font-family:'Rajdhani',sans-serif;font-size:1.2rem;font-weight:700;color:#c62828">
+                    ₹{_row['revenue']:,.0f}
+                  </div>
+                </div>""", unsafe_allow_html=True)
+
+        if len(_exp_soon) > 0:
+            st.markdown('<div class="sec-title">🟡 Expiring Soon — Action Needed</div>', unsafe_allow_html=True)
+            for _, _row in _exp_soon.iterrows():
+                _days_left2 = (_row["to_dt"].date() - _today).days
+                st.markdown(f"""
+                <div style="background:rgba(251,140,0,0.06);border:1.5px solid rgba(251,140,0,0.30);
+                            border-radius:12px;padding:14px 18px;margin-bottom:8px;
+                            display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:10px">
+                  <div style="display:flex;align-items:center;gap:12px">
+                    <span style="font-size:1.6rem">{_row['avatar']}</span>
+                    <div>
+                      <div style="font-weight:800;font-size:0.92rem;color:#e65100">{_row['name']}</div>
+                      <div style="font-size:0.75rem;color:#4a6a8a">{_row['store']}</div>
+                    </div>
+                  </div>
+                  <div style="font-size:0.78rem;color:#4a6a8a">
+                    Expires: <b style="color:#FB8C00">{_row['to']}</b>
+                  </div>
+                  <div style="background:rgba(251,140,0,0.14);color:#e65100;font-size:0.78rem;
+                              font-weight:800;padding:4px 14px;border-radius:20px;border:1px solid rgba(251,140,0,0.30)">
+                    ⏳ {_days_left2} days left
+                  </div>
+                  <div style="font-family:'Rajdhani',sans-serif;font-size:1.2rem;font-weight:700;color:#e65100">
+                    ₹{_row['revenue']:,.0f}
+                  </div>
+                </div>""", unsafe_allow_html=True)
+
+        # Full expiry table
+        sec("📋 Full Subscriber Validity Table")
+        _validity_table = _sub_df[[
+            "id", "name", "store", "plan", "from", "to", "status", "revenue"
+        ]].copy()
+        _validity_table.columns = ["Sub ID", "Name", "Store", "Plan", "Valid From", "Valid To", "Status", "Revenue (₹)"]
+        _validity_table["Valid To"]     = _validity_table.apply(lambda r: "No Expiry" if r["Sub ID"] == "ADM000" else r["Valid To"], axis=1)
+        _validity_table["Revenue (₹)"] = _validity_table.apply(lambda r: "—" if r["Sub ID"] == "ADM000" else f"₹{r['Revenue (₹)']:,.0f}", axis=1)
+        st.dataframe(_validity_table, use_container_width=True, hide_index=True)
+
+elif page == "💳  Plan Details":
+
+    st.markdown("""
+    <div class='page-title'>💳 Subscription Plans</div>
+    """, unsafe_allow_html=True)
+
+    # ── Determine current user's plan ─────────────────────────────────────────
+    _uname_plan    = st.session_state.username
+    _user_plan     = _USERS.get(_uname_plan, {}).get("plan", None)   # None for admin
+    _is_admin_plan = st.session_state.user_role == "admin"
+
+    # ── All features with per-plan access ─────────────────────────────────────
+    _ALL_FEATURES = [
+        ("🏠",  "Home Dashboard",          ["Starter", "Professional", "Enterprise"]),
+        ("📊",  "Analytics Overview",      ["Starter", "Professional", "Enterprise"]),
+        ("🧪",  "Inventory & Expiry Mgmt", ["Starter", "Professional", "Enterprise"]),
+        ("💳",  "Plan & Billing Details",  ["Starter", "Professional", "Enterprise"]),
+        ("ℹ️",  "About & Support",         ["Starter", "Professional", "Enterprise"]),
+        ("☀️",  "Morning Briefing",         ["Professional", "Enterprise"]),
+        ("📈",  "Sales & Demand Analysis", ["Professional", "Enterprise"]),
+        ("🏪",  "Supplier & Store Intel",  ["Professional", "Enterprise"]),
+        ("💡",  "AI Business Insights",    ["Enterprise"]),
+    ]
+
+    _PLANS = [
+        {
+            "name":    "Starter",
+            "price":   "₹299",
+            "peryear": "₹2,999 / year",
+            "savings": "Save ₹589/yr",
+            "tagline": "For single-store owners getting started",
+            "color":   "#00897B",
+            "light":   "rgba(0,137,123,0.08)",
+            "border":  "rgba(0,137,123,0.40)",
+        },
+        {
+            "name":    "Professional",
+            "price":   "₹799",
+            "peryear": "₹7,999 / year",
+            "savings": "Save ₹1,589/yr",
+            "tagline": "For growing pharmacy chains",
+            "color":   "#1565C0",
+            "light":   "rgba(21,101,192,0.08)",
+            "border":  "rgba(21,101,192,0.45)",
+        },
+        {
+            "name":    "Enterprise",
+            "price":   "₹1,999",
+            "peryear": "₹19,999 / year",
+            "savings": "Save ₹3,989/yr",
+            "tagline": "Full-power multi-store analytics + AI",
+            "color":   "#6A1B9A",
+            "light":   "rgba(106,27,154,0.08)",
+            "border":  "rgba(106,27,154,0.40)",
+        },
+    ]
+
+    # ── Rank helper: Starter=0, Professional=1, Enterprise=2 ──────────────────
+    _PLAN_RANK = {"Starter": 0, "Professional": 1, "Enterprise": 2}
+
+    # ── Subscription expiry data per store ────────────────────────────────────
+    _STORE_EXPIRY = {
+        "MedPlus Ameerpet":      {"from": "2026-01-15", "to": "2027-01-14"},
+        "Apollo Kukatpally":     {"from": "2026-02-01", "to": "2027-02-01"},
+        "WellCare Banjara Hills":{"from": "2026-03-01", "to": "2027-03-01"},
+        "HealthFirst Madhapur":  {"from": "2026-01-20", "to": "2027-01-20"},
+        "CityMed Dilsukhnagar":  {"from": "2026-02-15", "to": "2027-02-15"},
+    }
+
+    # ══════════════════════════════════════════════════════════════════════════
+    # EXPIRY POPUP — store owners only, shown once per session on this page
+    # ══════════════════════════════════════════════════════════════════════════
+    if not _is_admin_plan:
+        _popup_key = f"plan_expiry_popup_dismissed_{st.session_state.username}"
+        if _popup_key not in st.session_state:
+            st.session_state[_popup_key] = False
+
+        if not st.session_state[_popup_key]:
+            _exp_store = st.session_state.user_store
+            _exp_info  = _STORE_EXPIRY.get(_exp_store, {})
+            _today_dt  = datetime.date.today()
+
+            if _exp_info:
+                _exp_end_dt   = datetime.date.fromisoformat(_exp_info["to"])
+                _exp_start_dt = datetime.date.fromisoformat(_exp_info["from"])
+                _days_left    = (_exp_end_dt - _today_dt).days
+                _total_days   = (_exp_end_dt - _exp_start_dt).days
+                _days_used    = (_today_dt - _exp_start_dt).days
+                _pct_used     = min(100, max(0, round(_days_used / _total_days * 100)))
+                _pct_left     = 100 - _pct_used
+
+                # Urgency tier
+                if _days_left <= 0:
+                    _exp_color  = "#C62828"
+                    _exp_icon   = "⛔"
+                    _exp_status = "Expired"
+                    _exp_msg    = "Your subscription has expired. Renew immediately to restore access."
+                    _bar_color  = "#EF5350"
+                elif _days_left <= 30:
+                    _exp_color  = "#E65100"
+                    _exp_icon   = "⚠️"
+                    _exp_status = "Expiring Soon"
+                    _exp_msg    = f"Your plan expires in <b>{_days_left} days</b>. Renew now to avoid interruption."
+                    _bar_color  = "#FF7043"
+                elif _days_left <= 90:
+                    _exp_color  = "#F9A825"
+                    _exp_icon   = "🔔"
+                    _exp_status = "Renew Soon"
+                    _exp_msg    = f"Your plan expires in <b>{_days_left} days</b>. Plan your renewal early."
+                    _bar_color  = "#FFCA28"
+                else:
+                    _exp_color  = "#2E7D32"
+                    _exp_icon   = "✅"
+                    _exp_status = "Active & Healthy"
+                    _exp_msg    = f"Your subscription is active with <b>{_days_left} days</b> remaining."
+                    _bar_color  = "#43A047"
+
+                _exp_end_fmt   = _exp_end_dt.strftime("%d %b %Y")
+                _exp_start_fmt = _exp_start_dt.strftime("%d %b %Y")
+                _my_plan_now   = _user_plan or "Starter"
+                _my_plan_color = next(p["color"] for p in _PLANS if p["name"] == _my_plan_now)
+
+                # ── Render subscription status notice (flat HTML — Streamlit-safe) ──
+                # Deep nesting + HTML comments inside st.markdown break Streamlit's
+                # sanitizer and cause raw HTML text to appear. Use shallow, separate
+                # st.markdown() calls instead, each with simple single-level HTML.
+
+                _store_label = st.session_state.user_store
+                _my_plan_now = _user_plan or "Starter"
+                _days_safe   = max(0, _days_left)
+
+                # Header bar
+                st.markdown(
+                    f'<div style="background:{_exp_color};border-radius:14px 14px 0 0;'
+                    f'padding:18px 24px 14px;margin-top:8px">'
+                    f'<span style="font-size:1.6rem">{_exp_icon}</span>&nbsp;'
+                    f'<span style="font-size:1.1rem;font-weight:800;color:#fff;vertical-align:middle">'
+                    f'Subscription Status</span><br>'
+                    f'<span style="font-size:0.82rem;color:rgba(255,255,255,0.85)">'
+                    f'{_store_label} &nbsp;·&nbsp; {_my_plan_now} Plan</span>'
+                    f'</div>',
+                    unsafe_allow_html=True,
+                )
+
+                # Days remaining + status badge row
+                _days_left_col, _status_col = st.columns([1, 1])
+                with _days_left_col:
+                    st.markdown(
+                        f'<div style="background:#f8fafc;border:1px solid #e2e8f0;'
+                        f'border-radius:0;padding:16px 20px;text-align:center">'
+                        f'<div style="font-size:0.70rem;font-weight:700;color:#8aa0b8;'
+                        f'letter-spacing:1px;margin-bottom:4px">DAYS REMAINING</div>'
+                        f'<div style="font-size:2.8rem;font-weight:800;color:{_exp_color};'
+                        f'line-height:1">{_days_safe}</div>'
+                        f'<div style="font-size:0.78rem;color:#6a8aa8;margin-top:4px">'
+                        f'out of {_total_days} total days</div>'
+                        f'</div>',
+                        unsafe_allow_html=True,
+                    )
+                with _status_col:
+                    st.markdown(
+                        f'<div style="background:#f8fafc;border:1px solid #e2e8f0;'
+                        f'border-radius:0;padding:16px 20px;text-align:center;height:100%">'
+                        f'<div style="font-size:0.70rem;font-weight:700;color:#8aa0b8;'
+                        f'letter-spacing:1px;margin-bottom:8px">STATUS</div>'
+                        f'<div style="display:inline-block;background:#fff;border:1.5px solid {_exp_color};'
+                        f'color:{_exp_color};font-size:0.80rem;font-weight:800;'
+                        f'padding:6px 18px;border-radius:20px">{_exp_status}</div>'
+                        f'</div>',
+                        unsafe_allow_html=True,
+                    )
+
+                # Progress bar — plain HTML, no nesting deeper than 2 levels
+                _bar_w = f"{_pct_left}%"
+                st.markdown(
+                    f'<div style="background:#fff;border:1px solid #e2e8f0;padding:14px 20px">'
+                    f'<div style="font-size:0.72rem;color:#8aa0b8;margin-bottom:6px">'
+                    f'Plan started {_exp_start_fmt} &nbsp;→&nbsp; Expires {_exp_end_fmt}</div>'
+                    f'<div style="background:#F0F4F8;border-radius:20px;height:10px;overflow:hidden">'
+                    f'<div style="width:{_bar_w};background:{_bar_color};height:10px;'
+                    f'border-radius:20px"></div></div>'
+                    f'<div style="display:flex;justify-content:space-between;'
+                    f'font-size:0.71rem;color:#aab4c0;margin-top:4px">'
+                    f'<span>{_pct_used}% used</span><span>{_pct_left}% remaining</span></div>'
+                    f'</div>',
+                    unsafe_allow_html=True,
+                )
+
+                # Message + renew link
+                st.markdown(
+                    f'<div style="background:#F7FAFD;border-left:4px solid {_exp_color};'
+                    f'border-radius:0 0 14px 14px;padding:14px 20px 18px">'
+                    f'<div style="font-size:0.84rem;color:#3a5068;margin-bottom:12px">'
+                    f'{_exp_msg} &nbsp; Contact '
+                    f'<b style="color:#1565C0">support@pharmadash.in</b> to renew.</div>'
+                    f'<a href="mailto:support@pharmadash.in?subject=Renew {_my_plan_now} Plan - {_store_label}" '
+                    f'style="display:inline-block;background:{_exp_color};color:#fff;'
+                    f'font-size:0.84rem;font-weight:700;padding:9px 22px;border-radius:8px;'
+                    f'text-decoration:none">&#9654;&nbsp; Renew Now</a>'
+                    f'</div>',
+                    unsafe_allow_html=True,
+                )
+
+                # Dismiss button
+                _dc1, _dc2, _dc3 = st.columns([1, 2, 1])
+                with _dc2:
+                    if st.button(
+                        "✕  Continue to Plans",
+                        key="dismiss_expiry_popup",
+                        use_container_width=True,
+                        type="primary",
+                    ):
+                        st.session_state[_popup_key] = True
+                        st.rerun()
+
+                st.markdown("<hr style='margin:24px 0 8px'>", unsafe_allow_html=True)
+
+    # ══════════════════════════════════════════════════════════════════════════
+    # ADMIN VIEW — identical card layout to store owner view; no active plan
+    # ══════════════════════════════════════════════════════════════════════════
+    if _is_admin_plan:
+
+        # ── Extended plan metadata (same as store owner) ──────────────────────
+        _PLAN_META = {
+            "Starter":      {"tag": "Essential",    "popular": False},
+            "Professional": {"tag": "Most Popular", "popular": True},
+            "Enterprise":   {"tag": "Full Access",  "popular": False},
+        }
+
+        # ── Annual prices (same as store owner) ───────────────────────────────
+        _ANNUAL_PRICE = {
+            "Starter":      "₹249",
+            "Professional": "₹666",
+            "Enterprise":   "₹1,666",
+        }
+
+        # ── Billing toggle (shared session key with store owner) ──────────────
+        if "plan_billing" not in st.session_state:
+            st.session_state.plan_billing = "Monthly"
+
+        # ── Admin identity banner ─────────────────────────────────────────────
+        st.markdown(
+            '<div style="background:rgba(255,255,255,0.55);'
+            'border:1px solid rgba(229,57,53,0.35);border-left:5px solid #E53935;'
+            'border-radius:14px;padding:14px 22px;margin-bottom:24px;'
+            'display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:10px">'
+            '<div style="display:flex;align-items:center;gap:14px">'
+            '<span style="font-size:1.8rem">🛡️</span>'
+            '<div>'
+            '<div style="font-weight:700;font-size:0.96rem;color:#0b3d6e">' + st.session_state.user_name + '</div>'
+            '<div style="font-size:0.76rem;color:#4a6a8a;margin-top:2px">System Administrator &middot; Full platform access</div>'
+            '</div></div>'
+            '<div style="display:flex;align-items:center;gap:8px">'
+            '<span style="font-size:0.74rem;color:#6a8aa8;font-weight:500">Access Level</span>'
+            '<span style="background:#E53935;color:#fff;font-size:0.74rem;font-weight:700;'
+            'padding:5px 16px;border-radius:20px;letter-spacing:0.4px">&#128737; Admin</span>'
+            '</div></div>',
+            unsafe_allow_html=True,
+        )
+
+        # ── Billing toggle + save badge ───────────────────────────────────────
+        _tog_col1, _tog_col2, _tog_col3 = st.columns([2, 1.4, 2])
+        with _tog_col2:
+            st.markdown(
+                '<div style="display:flex;align-items:center;justify-content:center;'
+                'background:rgba(0,0,0,0.05);border-radius:30px;padding:4px;gap:2px;margin-bottom:8px">',
+                unsafe_allow_html=True,
+            )
+            _billing_choice = st.radio(
+                "Billing cycle",
+                ["Monthly", "Annual"],
+                index=0 if st.session_state.plan_billing == "Monthly" else 1,
+                horizontal=True,
+                label_visibility="collapsed",
+                key="plan_billing_radio",
+            )
+            st.session_state.plan_billing = _billing_choice
+            if _billing_choice == "Annual":
+                st.markdown(
+                    '<div style="text-align:center;margin-top:-6px;margin-bottom:10px">'
+                    '<span style="background:#E8F5E9;color:#1B5E20;font-size:0.74rem;font-weight:700;'
+                    'padding:3px 12px;border-radius:20px;border:1px solid #A5D6A7">'
+                    '&#127381; Save up to 17% with annual billing</span></div>',
+                    unsafe_allow_html=True,
+                )
+
+        _use_annual = (st.session_state.plan_billing == "Annual")
+
+        # ── 3-column plan comparison grid ─────────────────────────────────────
+        _cols = st.columns(3, gap="medium")
+
+        for _col, _plan in zip(_cols, _PLANS):
+            _pn        = _plan["name"]
+            _pc        = _plan["color"]
+            _pl        = _plan["light"]
+            _pb        = _plan["border"]
+            _pt        = _plan["tagline"]
+            _pp        = _ANNUAL_PRICE[_pn] if _use_annual else _plan["price"]
+            _py        = _plan["peryear"]
+            _ps        = _plan["savings"]
+            _ptag      = _PLAN_META[_pn]["tag"]
+            _is_pop    = _PLAN_META[_pn]["popular"]
+            _is_active = False   # admin has no active plan
+            _price_lbl = "/ month, billed annually" if _use_annual else "/ month"
+
+            # Feature count summary
+            _feat_count = sum(1 for _fi, _fl, _fps in _ALL_FEATURES if _pn in _fps)
+            _total_feat = len(_ALL_FEATURES)
+
+            # Build feature rows
+            _feat_html = ""
+            for _fi, _fl, _fps in _ALL_FEATURES:
+                if _pn in _fps:
+                    _feat_html += (
+                        '<div style="display:flex;align-items:center;gap:9px;padding:7px 0;'
+                        'border-bottom:1px solid rgba(0,0,0,0.05)">'
+                        '<span style="font-size:0.82rem;width:20px;text-align:center">' + _fi + '</span>'
+                        '<span style="font-size:0.82rem;color:#1a3a55;font-weight:500">' + _fl + '</span>'
+                        '<span style="margin-left:auto;color:#2E7D32;font-weight:700;font-size:0.88rem">&#10003;</span>'
+                        '</div>'
+                    )
+                else:
+                    _feat_html += (
+                        '<div style="display:flex;align-items:center;gap:9px;padding:7px 0;'
+                        'border-bottom:1px solid rgba(0,0,0,0.04);opacity:0.35">'
+                        '<span style="font-size:0.82rem;width:20px;text-align:center">&#128274;</span>'
+                        '<span style="font-size:0.82rem;color:#aaa;font-weight:400;'
+                        'text-decoration:line-through">' + _fl + '</span>'
+                        '</div>'
+                    )
+
+            # Ribbon — most popular gets orange; others get plan tag
+            if _is_pop:
+                _ribbon = (
+                    '<div style="background:#FF6F00;color:#fff;font-size:0.70rem;font-weight:800;'
+                    'letter-spacing:1px;padding:7px 0;text-align:center">'
+                    '&#11088; MOST POPULAR</div>'
+                )
+            else:
+                _ribbon = (
+                    '<div style="background:' + _pc + '18;color:' + _pc + ';font-size:0.67rem;font-weight:700;'
+                    'letter-spacing:1px;padding:7px 0;text-align:center">' + _ptag.upper() + '</div>'
+                )
+
+            # Footer CTA — admin sees a manage-subscribers link
+            _footer_html = (
+                '<div style="text-align:center;padding:11px 0">'
+                '<span style="display:inline-block;font-size:0.82rem;font-weight:700;'
+                'color:' + _pc + ';background:' + _pc + '14;border:1.5px solid ' + _pc + '55;'
+                'border-radius:8px;padding:8px 22px;letter-spacing:0.2px">'
+                '&#128101; ' + str(sum(1 for _u in _USERS.values() if _u.get("plan") == _pn)) +
+                ' Subscriber(s)</span></div>'
+            )
+
+            # Card style — popular gets warm highlight, others standard
+            if _is_pop:
+                _card_style = (
+                    'background:linear-gradient(170deg,#fff,#FFF8E1);'
+                    'border:2px solid #FF6F00;border-radius:18px;overflow:hidden;'
+                    'box-shadow:0 6px 24px rgba(255,111,0,0.18);'
+                    'min-height:580px;display:flex;flex-direction:column'
+                )
+            else:
+                _card_style = (
+                    'background:linear-gradient(170deg,#fff,' + _pl + ');'
+                    'border:1.5px solid ' + _pb + ';border-radius:18px;overflow:hidden;'
+                    'box-shadow:0 3px 14px rgba(0,0,0,0.06);'
+                    'min-height:580px;display:flex;flex-direction:column'
+                )
+
+            _col.markdown(
+                '<div style="' + _card_style + '">'
+                + _ribbon +
+                '<div style="padding:20px 20px 14px;flex:1">'
+                '<div style="font-size:1.45rem;font-weight:700;color:' + _pc + ';margin-bottom:2px">' + _pn + '</div>'
+                '<div style="font-size:0.76rem;color:#6a8aa8;margin-bottom:8px;line-height:1.5">' + _pt + '</div>'
+                '<div style="margin-bottom:14px">'
+                '<span style="background:' + _pc + '15;color:' + _pc + ';font-size:0.70rem;font-weight:700;'
+                'padding:3px 10px;border-radius:20px">'
+                + str(_feat_count) + ' of ' + str(_total_feat) + ' features</span></div>'
+                '<div style="display:flex;align-items:baseline;gap:4px;margin-bottom:2px">'
+                '<span style="font-size:2.0rem;font-weight:700;color:#0d2f52;line-height:1">' + _pp + '</span>'
+                '<span style="font-size:0.78rem;color:#8aa0b8">' + _price_lbl + '</span>'
+                '</div>'
+                '<div style="font-size:0.74rem;color:#7a90a8;margin-bottom:16px">'
+                + (_py + ' &nbsp;<span style="color:#2E7D32;font-weight:600">&#9660; ' + _ps + '</span>' if not _use_annual else '<span style="color:#2E7D32;font-weight:600">&#10003; Annual billing active</span>') +
+                '</div>'
+                '<div style="height:1px;background:rgba(0,0,0,0.07);margin-bottom:12px"></div>'
+                '<div style="font-size:0.67rem;font-weight:700;color:#8aa0b8;'
+                'letter-spacing:0.9px;margin-bottom:8px">FEATURES INCLUDED</div>'
+                + _feat_html +
+                '</div>'
+                '<div style="padding:10px 16px 14px;border-top:1px solid rgba(0,0,0,0.06);'
+                'background:rgba(255,255,255,0.5)">'
+                + _footer_html +
+                '</div>'
+                '</div>',
+                unsafe_allow_html=True,
+            )
+
+        # ── Contact note (same as store owner) ────────────────────────────────
+        st.markdown(
+            '<div style="margin-top:32px;background:rgba(21,101,192,0.05);'
+            'border:1px solid rgba(21,101,192,0.18);border-radius:12px;padding:14px 20px;'
+            'display:flex;align-items:center;gap:12px">'
+            '<span style="font-size:1.2rem">&#128222;</span>'
+            '<div style="font-size:0.80rem;color:#4a6a8a;line-height:1.7">'
+            'To <b>manage subscriber plans</b> or for billing queries, visit '
+            '<b style="color:#1565C0">Subscribers</b> page &nbsp;&mdash;&nbsp; '
+            'All plan changes take effect immediately.'
+            '</div></div>',
+            unsafe_allow_html=True,
+        )
+
+    # ══════════════════════════════════════════════════════════════════════════
+    # STORE OWNER VIEW — all 3 plans; active elevated; billing toggle; CTAs
+    # ══════════════════════════════════════════════════════════════════════════
+    else:
+        _my_plan = _user_plan or "Starter"
+        _my_cfg  = next(p for p in _PLANS if p["name"] == _my_plan)
+        _my_pc   = _my_cfg["color"]
+        _my_bdr  = _my_cfg["border"]
+        _my_av   = st.session_state.user_avatar
+        _my_nm   = st.session_state.user_name
+        _my_st   = st.session_state.user_store
+
+        # ── Extended plan metadata ────────────────────────────────────────────
+        _PLAN_META = {
+            "Starter":      {"tag": "Essential",    "popular": False},
+            "Professional": {"tag": "Most Popular", "popular": True},
+            "Enterprise":   {"tag": "Full Access",  "popular": False},
+        }
+
+        # ── Annual prices for toggle ──────────────────────────────────────────
+        _ANNUAL_PRICE = {
+            "Starter":      "₹249",
+            "Professional": "₹666",
+            "Enterprise":   "₹1,666",
+        }
+
+        # ── Billing toggle (monthly / annual) — uses session state ────────────
+        if "plan_billing" not in st.session_state:
+            st.session_state.plan_billing = "Monthly"
+
+        # ── Identity banner ───────────────────────────────────────────────────
+        st.markdown(
+            '<div style="background:rgba(255,255,255,0.55);'
+            'border:1px solid ' + _my_bdr + ';border-left:5px solid ' + _my_pc + ';'
+            'border-radius:14px;padding:14px 22px;margin-bottom:24px;'
+            'display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:10px">'
+            '<div style="display:flex;align-items:center;gap:14px">'
+            '<span style="font-size:1.8rem">' + _my_av + '</span>'
+            '<div>'
+            '<div style="font-weight:700;font-size:0.96rem;color:#0b3d6e">' + _my_nm + '</div>'
+            '<div style="font-size:0.76rem;color:#4a6a8a;margin-top:2px">Viewing your store data &middot; ' + _my_st + '</div>'
+            '</div></div>'
+            '<div style="display:flex;align-items:center;gap:8px">'
+            '<span style="font-size:0.74rem;color:#6a8aa8;font-weight:500">Active Plan</span>'
+            '<span style="background:' + _my_pc + ';color:#fff;font-size:0.74rem;font-weight:700;'
+            'padding:5px 16px;border-radius:20px;letter-spacing:0.4px">&#9733; ' + _my_plan + '</span>'
+            '</div></div>',
+            unsafe_allow_html=True,
+        )
+
+        # ── Billing toggle + save badge ───────────────────────────────────────
+        _tog_col1, _tog_col2, _tog_col3 = st.columns([2, 1.4, 2])
+        with _tog_col2:
+            st.markdown(
+                '<div style="display:flex;align-items:center;justify-content:center;'
+                'background:rgba(0,0,0,0.05);border-radius:30px;padding:4px;gap:2px;margin-bottom:8px">',
+                unsafe_allow_html=True,
+            )
+            _billing_choice = st.radio(
+                "Billing cycle",
+                ["Monthly", "Annual"],
+                index=0 if st.session_state.plan_billing == "Monthly" else 1,
+                horizontal=True,
+                label_visibility="collapsed",
+                key="plan_billing_radio",
+            )
+            st.session_state.plan_billing = _billing_choice
+            if _billing_choice == "Annual":
+                st.markdown(
+                    '<div style="text-align:center;margin-top:-6px;margin-bottom:10px">'
+                    '<span style="background:#E8F5E9;color:#1B5E20;font-size:0.74rem;font-weight:700;'
+                    'padding:3px 12px;border-radius:20px;border:1px solid #A5D6A7">'
+                    '&#127381; Save up to 17% with annual billing</span></div>',
+                    unsafe_allow_html=True,
+                )
+
+        _use_annual = (st.session_state.plan_billing == "Annual")
+
+        # ── 3-column plan comparison grid ─────────────────────────────────────
+        _cols = st.columns(3, gap="medium")
+
+        for _col, _plan in zip(_cols, _PLANS):
+            _pn        = _plan["name"]
+            _pc        = _plan["color"]
+            _pl        = _plan["light"]
+            _pb        = _plan["border"]
+            _pt        = _plan["tagline"]
+            _pp        = _ANNUAL_PRICE[_pn] if _use_annual else _plan["price"]
+            _py        = _plan["peryear"]
+            _ps        = _plan["savings"]
+            _ptag      = _PLAN_META[_pn]["tag"]
+            _is_pop    = _PLAN_META[_pn]["popular"]
+            _is_active = (_pn == _my_plan)
+            _price_lbl = "/ month, billed annually" if _use_annual else "/ month"
+
+            # Feature count summary
+            _feat_count = sum(1 for _fi, _fl, _fps in _ALL_FEATURES if _pn in _fps)
+            _total_feat = len(_ALL_FEATURES)
+
+            # Build feature rows
+            _feat_html = ""
+            for _fi, _fl, _fps in _ALL_FEATURES:
+                if _pn in _fps:
+                    _feat_html += (
+                        '<div style="display:flex;align-items:center;gap:9px;padding:7px 0;'
+                        'border-bottom:1px solid rgba(0,0,0,0.05)">'
+                        '<span style="font-size:0.82rem;width:20px;text-align:center">' + _fi + '</span>'
+                        '<span style="font-size:0.82rem;color:#1a3a55;font-weight:500">' + _fl + '</span>'
+                        '<span style="margin-left:auto;color:#2E7D32;font-weight:700;font-size:0.88rem">&#10003;</span>'
+                        '</div>'
+                    )
+                else:
+                    _feat_html += (
+                        '<div style="display:flex;align-items:center;gap:9px;padding:7px 0;'
+                        'border-bottom:1px solid rgba(0,0,0,0.04);opacity:0.35">'
+                        '<span style="font-size:0.82rem;width:20px;text-align:center">&#128274;</span>'
+                        '<span style="font-size:0.82rem;color:#aaa;font-weight:400;'
+                        'text-decoration:line-through">' + _fl + '</span>'
+                        '</div>'
+                    )
+
+            # Ribbon: active overrides popular badge
+            if _is_active:
+                _ribbon = (
+                    '<div style="background:' + _pc + ';color:#fff;font-size:0.67rem;font-weight:800;'
+                    'letter-spacing:1px;padding:7px 0;text-align:center">'
+                    '&#9733; YOUR ACTIVE PLAN</div>'
+                )
+            elif _is_pop:
+                _ribbon = (
+                    '<div style="background:#FF6F00;color:#fff;font-size:0.70rem;font-weight:800;'
+                    'letter-spacing:1px;padding:7px 0;text-align:center">'
+                    '&#11088; MOST POPULAR</div>'
+                )
+            else:
+                _ribbon = (
+                    '<div style="background:' + _pc + '18;color:' + _pc + ';font-size:0.67rem;font-weight:700;'
+                    'letter-spacing:1px;padding:7px 0;text-align:center">' + _ptag.upper() + '</div>'
+                )
+
+            # Footer CTA
+            if _is_active:
+                _footer_html = (
+                    '<div style="text-align:center;padding:11px 0">'
+                    '<span style="display:inline-block;font-size:0.82rem;font-weight:700;'
+                    'color:' + _pc + ';background:' + _pc + '14;border:1.5px solid ' + _pc + '55;'
+                    'border-radius:8px;padding:8px 22px;letter-spacing:0.2px">'
+                    '&#10003; Your Current Plan</span></div>'
+                )
+            else:
+                _footer_html = (
+                    '<div style="text-align:center;padding:11px 0">'
+                    '<a href="mailto:support@pharmadash.in?subject=Upgrade to ' + _pn + ' Plan" '
+                    'style="display:inline-block;font-size:0.82rem;font-weight:700;color:#fff;'
+                    'background:' + _pc + ';border-radius:8px;padding:9px 22px;'
+                    'text-decoration:none;letter-spacing:0.2px">'
+                    '&#8593; Upgrade to ' + _pn + '</a></div>'
+                )
+
+            # Card elevation for active
+            if _is_active:
+                _card_style = (
+                    'background:linear-gradient(170deg,#ffffff,' + _pl + ');'
+                    'border:2px solid ' + _pc + ';border-radius:18px;overflow:hidden;'
+                    'box-shadow:0 12px 40px ' + _pc + '28;'
+                    'transform:translateY(-10px);'
+                    'min-height:580px;display:flex;flex-direction:column'
+                )
+            elif _is_pop:
+                _card_style = (
+                    'background:linear-gradient(170deg,#fff,#FFF8E1);'
+                    'border:2px solid #FF6F00;border-radius:18px;overflow:hidden;'
+                    'box-shadow:0 6px 24px rgba(255,111,0,0.18);'
+                    'min-height:580px;display:flex;flex-direction:column'
+                )
+            else:
+                _card_style = (
+                    'background:linear-gradient(170deg,#fff,' + _pl + ');'
+                    'border:1.5px solid ' + _pb + ';border-radius:18px;overflow:hidden;'
+                    'box-shadow:0 3px 14px rgba(0,0,0,0.06);'
+                    'min-height:580px;display:flex;flex-direction:column'
+                )
+
+            _col.markdown(
+                '<div style="' + _card_style + '">'
+                + _ribbon +
+                '<div style="padding:20px 20px 14px;flex:1">'
+                # Plan name
+                '<div style="font-size:1.45rem;font-weight:700;color:' + _pc + ';margin-bottom:2px">' + _pn + '</div>'
+                # Tagline
+                '<div style="font-size:0.76rem;color:#6a8aa8;margin-bottom:8px;line-height:1.5">' + _pt + '</div>'
+                # Feature count pill
+                '<div style="margin-bottom:14px">'
+                '<span style="background:' + _pc + '15;color:' + _pc + ';font-size:0.70rem;font-weight:700;'
+                'padding:3px 10px;border-radius:20px">'
+                + str(_feat_count) + ' of ' + str(_total_feat) + ' features</span></div>'
+                # Price
+                '<div style="display:flex;align-items:baseline;gap:4px;margin-bottom:2px">'
+                '<span style="font-size:2.0rem;font-weight:700;color:#0d2f52;line-height:1">' + _pp + '</span>'
+                '<span style="font-size:0.78rem;color:#8aa0b8">' + _price_lbl + '</span>'
+                '</div>'
+                '<div style="font-size:0.74rem;color:#7a90a8;margin-bottom:16px">'
+                + (_py + ' &nbsp;<span style="color:#2E7D32;font-weight:600">&#9660; ' + _ps + '</span>' if not _use_annual else '<span style="color:#2E7D32;font-weight:600">&#10003; Annual billing active</span>') +
+                '</div>'
+                '<div style="height:1px;background:rgba(0,0,0,0.07);margin-bottom:12px"></div>'
+                '<div style="font-size:0.67rem;font-weight:700;color:#8aa0b8;'
+                'letter-spacing:0.9px;margin-bottom:8px">FEATURES INCLUDED</div>'
+                + _feat_html +
+                '</div>'
+                '<div style="padding:10px 16px 14px;border-top:1px solid rgba(0,0,0,0.06);'
+                'background:rgba(255,255,255,0.5)">'
+                + _footer_html +
+                '</div>'
+                '</div>',
+                unsafe_allow_html=True,
+            )
+
+        # ── Contact note ──────────────────────────────────────────────────────
+        st.markdown(
+            '<div style="margin-top:32px;background:rgba(21,101,192,0.05);'
+            'border:1px solid rgba(21,101,192,0.18);border-radius:12px;padding:14px 20px;'
+            'display:flex;align-items:center;gap:12px">'
+            '<span style="font-size:1.2rem">&#128222;</span>'
+            '<div style="font-size:0.80rem;color:#4a6a8a;line-height:1.7">'
+            'To <b>upgrade your plan</b> or for billing queries, contact '
+            '<b style="color:#1565C0">support@pharmadash.in</b> &nbsp;&mdash;&nbsp; '
+            'All upgrades take effect immediately.'
+            '</div></div>',
+            unsafe_allow_html=True,
+        )
+
+
+elif page == "ℹ️  About Us":
+
+    st.markdown("""
+    <div class='page-title'>ℹ️ About PharmaDash</div>
+    """, unsafe_allow_html=True)
+
+    st.markdown("""
+    <div style="
+        background:rgba(255,255,255,0.90);
+        padding:35px;
+        border-radius:18px;
+        box-shadow:0 6px 18px rgba(0,0,0,0.08);
+        border:1px solid rgba(255,255,255,0.5);
+    ">
+
+    <h2 style="color:#1565C0;">🏥 PharmaDash</h2>
+
+    <p style="font-size:17px; line-height:1.8; color:#333;">
+    PharmaDash is an AI-powered pharmacy inventory and sales analytics platform
+    designed for modern medical stores and pharmacy chains.
+    </p>
+
+    <p style="font-size:16px; line-height:1.8; color:#444;">
+    The platform helps pharmacy owners manage:
+    </p>
+
+    <ul style="font-size:16px; line-height:2; color:#444;">
+        <li>💊 Medicine Inventory Tracking</li>
+        <li>📈 Sales & Revenue Analytics</li>
+        <li>⚠️ Expiry Monitoring</li>
+        <li>🏪 Multi-Store Management</li>
+        <li>🤖 AI Business Insights</li>
+        <li>📦 Supplier Performance Analysis</li>
+        <li>📊 Smart Dashboard Reporting</li>
+    </ul>
+
+    <hr>
+
+    <h3 style="color:#0b3d6e;">🎯 Our Mission</h3>
+
+    <p style="font-size:16px; line-height:1.8; color:#444;">
+    To simplify pharmacy operations using smart analytics and AI-driven insights,
+    helping businesses reduce medicine wastage, improve stock management,
+    and increase profitability.
+    </p>
+
+    <hr>
+
+    <h3 style="color:#0b3d6e;">🚀 Features</h3>
+
+    <ul style="font-size:16px; line-height:2; color:#444;">
+        <li>Real-time inventory visibility</li>
+        <li>Advanced pharmacy analytics</li>
+        <li>Automated expiry alerts</li>
+        <li>Store performance tracking</li>
+        <li>Interactive visual dashboards</li>
+        <li>Business intelligence reports</li>
+    </ul>
+
+    <hr>
+
+    <div style="
+        text-align:center;
+        font-size:15px;
+        color:#666;
+        margin-top:20px;
+    ">
+        © 2026 PharmaDash • Smart Pharmacy Management System
+    </div>
+
+    </div>
+    """, unsafe_allow_html=True)
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# ENTRY POINT
+# ═══════════════════════════════════════════════════════════════════════════════
+# This module is executed by the Streamlit runtime — do not invoke directly.
+# To launch the application locally, run:
+#
+#   streamlit run pharma_update.py
+#
+# Ensure the dataset CSV files are present in the same directory before starting.
+# ═══════════════════════════════════════════════════════════════════════════════
