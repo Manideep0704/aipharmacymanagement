@@ -820,8 +820,8 @@ DATE_MAX    = None
 def get_db_engine():
     """
     Build and cache a SQLAlchemy engine connected to the PostgreSQL database.
-    Credentials are read from environment variables (set in .env).
-    Raises a clear Streamlit error if the connection fails.
+    Credentials are read from environment variables.
+    Returns the engine if successful, or None if connection fails.
     """
     from dotenv import load_dotenv
     load_dotenv()
@@ -833,11 +833,8 @@ def get_db_engine():
     pwd    = os.getenv("DB_PASSWORD", "")
 
     if psycopg2 is None:
-        st.error(
-            "❌ **psycopg2 is not installed.**\n\n"
-            "Run: `pip install psycopg2-binary` and restart."
-        )
-        st.stop()
+        logger.warning("psycopg2 is not installed.")
+        return None
 
     from urllib.parse import quote_plus
     url = f"postgresql+psycopg2://{user}:{quote_plus(pwd)}@{host}:{port}/{dbname}"
@@ -849,14 +846,8 @@ def get_db_engine():
         logger.info("PostgreSQL engine connected: %s:%s/%s", host, port, dbname)
         return engine
     except Exception as exc:
-        st.error(
-            f"❌ **Could not connect to PostgreSQL:**\n\n`{exc}`\n\n"
-            "**Check:**\n"
-            "- PostgreSQL is running on your machine\n"
-            "- `DB_HOST`, `DB_PORT`, `DB_USER`, `DB_PASSWORD`, `DB_NAME` in `.env` are correct\n"
-            "- Run `python setup_db.py` first to create the database and tables"
-        )
-        st.stop()
+        logger.warning("Could not connect to PostgreSQL (%s). Falling back to local CSV files.", exc)
+        return None
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -871,19 +862,32 @@ def load_data() -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame,
     these — never mutate them.
     """
     engine = get_db_engine()
+    loaded_from_db = False
 
-    try:
-        sales = pd.read_sql('SELECT * FROM fact_sales',    engine)
-        stock = pd.read_sql('SELECT * FROM fact_stock',    engine)
-        prod  = pd.read_sql('SELECT * FROM dim_products',  engine)
-        store = pd.read_sql('SELECT * FROM dim_store',     engine)
-        sup   = pd.read_sql('SELECT * FROM dim_suppliers', engine)
-    except Exception as exc:
-        st.error(
-            f"❌ **Failed to query database tables:**\n\n`{exc}`\n\n"
-            "Make sure you have run `python setup_db.py` to create and populate the tables."
-        )
-        st.stop()
+    if engine is not None:
+        try:
+            sales = pd.read_sql('SELECT * FROM fact_sales',    engine)
+            stock = pd.read_sql('SELECT * FROM fact_stock',    engine)
+            prod  = pd.read_sql('SELECT * FROM dim_products',  engine)
+            store = pd.read_sql('SELECT * FROM dim_store',     engine)
+            sup   = pd.read_sql('SELECT * FROM dim_suppliers', engine)
+            loaded_from_db = True
+            logger.info("Loaded data from PostgreSQL database.")
+        except Exception as exc:
+            logger.warning("Failed to query database tables (%s). Falling back to CSV files.", exc)
+
+    if not loaded_from_db:
+        try:
+            base = os.path.dirname(os.path.abspath(__file__))
+            sales = pd.read_csv(os.path.join(base, "Fact_Sales_20k.csv"))
+            stock = pd.read_csv(os.path.join(base, "Fact_Stock_20k.csv"))
+            prod  = pd.read_csv(os.path.join(base, "Dim_Products_20k.csv"))
+            store = pd.read_csv(os.path.join(base, "Dim_Store.csv"))
+            sup   = pd.read_csv(os.path.join(base, "Dim_Suppliers_20k.csv"))
+            logger.info("Loaded data from local CSV files.")
+        except Exception as exc:
+            st.error(f"❌ **Failed to load pharmacy data from CSV files:**\n\n`{exc}`")
+            st.stop()
 
     # Normalize column casings to handle PostgreSQL case insensitivity (e.g. lowercase column names)
     def normalize_cols(df: pd.DataFrame, expected_cols: list[str]) -> pd.DataFrame:
