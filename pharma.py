@@ -885,6 +885,17 @@ def load_data() -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame,
         )
         st.stop()
 
+    # Normalize column casings to handle PostgreSQL case insensitivity (e.g. lowercase column names)
+    def normalize_cols(df: pd.DataFrame, expected_cols: list[str]) -> pd.DataFrame:
+        mapping = {c.lower(): c for c in expected_cols}
+        return df.rename(columns={c: mapping[c.lower()] for c in df.columns if c.lower() in mapping})
+
+    sales = normalize_cols(sales, ['TransactionID', 'Date', 'ProductID', 'Store_ID', 'Medicine_Name', 'Category', 'QuantitySold', 'UnitPrice', 'TotalAmount', 'CustomerType'])
+    stock = normalize_cols(stock, ['StockID', 'Store_ID', 'ProductID', 'BatchNumber', 'ExpiryDate', 'QuantityOnHand', 'SupplierID', 'DaysToExpiry', 'ExpiryStatus'])
+    prod  = normalize_cols(prod,  ['ProductID', 'ProductName', 'Category', 'UnitCost', 'RetailPrice', 'ReorderPoint', 'SafetyStock'])
+    store = normalize_cols(store, ['Store_ID', 'Store_Name', 'Location', 'Latitude', 'Longitude'])
+    sup   = normalize_cols(sup,   ['SupplierID', 'Supplier_Name', 'QualityRating', 'LeadTimeDays', 'ContactInfo', 'Category'])
+
     # ── Dates ──────────────────────────────────────────────────────────────────
     sales["Date"]      = pd.to_datetime(sales["Date"], dayfirst=False, errors="coerce")
     sales["Month"]     = sales["Date"].dt.strftime("%B")
